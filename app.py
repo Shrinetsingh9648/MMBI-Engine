@@ -164,8 +164,8 @@ def load_model():
     return model, class_names, face_det
 
 INTEREST_MAP = {
-    "happy": 1.0, "surprise": 1.0, "neutral": 0.75,
-    "fear": 0.5, "sad": 0.25, "angry": 0.1, "disgust": 0.1,
+    "happy": 1.0, "surprise": 1.0, "neutral": 0.50,
+    "fear": 0.40, "sad": 0.25, "angry": 0.1, "disgust": 0.1,
 }
 
 # ── SIDEBAR ───────────────────────────────────────────────
@@ -305,7 +305,7 @@ if uploaded is not None:
                     emo_i  = int(np.argmax(preds))
                     emotion= class_names[emo_i]
                     conf   = float(preds[emo_i])
-                    if conf < 0.45:
+                    if conf < 0.55:
                         emotion = "neutral"
                     score = round(
                         INTEREST_MAP.get(emotion, 0.5) * 100, 1)
