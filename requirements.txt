@@ -1,8 +1,7 @@
 streamlit
 opencv-python-headless
-tensorflow-cpu
+tensorflow==2.18.0
 numpy
 pandas
 matplotlib
 reportlab
-protobuf<5
