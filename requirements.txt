@@ -1,7 +1,10 @@
 streamlit
 opencv-python-headless
-tensorflow==2.18.0
+tensorflow>=2.15,<2.19
 numpy
 pandas
 matplotlib
 reportlab
+librosa
+moviepy
+soundfile
