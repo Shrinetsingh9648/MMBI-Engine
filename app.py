@@ -191,20 +191,32 @@ def extract_audio_timeline(video_path, window_sec=1.0):
         return None
     try:
         clip = VideoFileClip(video_path)
-        if clip.audio is None:
-            clip.close()
-            return None
+if clip.audio is None:
+    clip.close()
+    return None
 
-        tmp_audio = tempfile.NamedTemporaryFile(
-            delete=False, suffix=".wav")
-        clip.audio.write_audiofile(
-            tmp_audio.name, fps=22050, verbose=False,
-            logger=None)
-        clip.close()
+tmp_audio = tempfile.NamedTemporaryFile(
+    delete=False, suffix=".wav")
+tmp_name = tmp_audio.name
+tmp_audio.close()
 
-        y, sr = librosa.load(tmp_audio.name, sr=22050)
-        os.unlink(tmp_audio.name)
+# moviepy 2.x uses write_audiofile differently
+try:
+    clip.audio.write_audiofile(
+        tmp_name, fps=22050,
+        verbose=False, logger=None)
+except TypeError:
+    # fallback for older moviepy
+    clip.audio.write_audiofile(
+        tmp_name, fps=22050,
+        verbose=False)
+clip.close()
 
+y, sr = librosa.load(tmp_name, sr=22050)
+try:
+    os.unlink(tmp_name)
+except Exception:
+    pass
         if len(y) == 0:
             return None
 
