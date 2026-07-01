@@ -182,46 +182,62 @@ INTEREST_MAP = {
 # ── AUDIO ANALYSIS ────────────────────────────────────────
 def extract_audio_timeline(video_path, window_sec=1.0):
     """
-    Extracts per-second audio energy + pitch variation scores.
-    Returns a dict: {time_bucket: audio_score (0-100)}
-    Returns None if audio unavailable or extraction fails.
+    Extracts per-second audio energy + pitch variation.
+    Uses ffmpeg (always available) instead of moviepy.
+    Returns dict {time_bucket: score} or None.
     """
     if not AUDIO_AVAILABLE:
         return None
-    try:
-        clip = VideoFileClip(video_path)
-        if clip.audio is None:
-            clip.close()
-            return None
 
+    tmp_audio = None
+    try:
+        # Use ffmpeg directly — always available on Streamlit Cloud
         tmp_audio = tempfile.NamedTemporaryFile(
             delete=False, suffix=".wav")
-        clip.audio.write_audiofile(
-            tmp_audio.name, fps=22050, verbose=False,
-            logger=None)
-        clip.close()
+        tmp_name  = tmp_audio.name
+        tmp_audio.close()
 
-        y, sr = librosa.load(tmp_audio.name, sr=22050)
-        os.unlink(tmp_audio.name)
+        ret = os.system(
+            f'ffmpeg -y -i "{video_path}" '
+            f'-ac 1 -ar 22050 '
+            f'-vn "{tmp_name}" '
+            f'-loglevel error'
+        )
 
-        if len(y) == 0:
+        if ret != 0 or not os.path.exists(tmp_name):
             return None
 
-        hop = int(window_sec * sr)
+        file_size = os.path.getsize(tmp_name)
+        if file_size < 1000:
+            return None
+
+        y, sr = librosa.load(tmp_name, sr=22050)
+
+        try:
+            os.unlink(tmp_name)
+        except Exception:
+            pass
+
+        if len(y) < sr * 0.5:
+            return None
+
+        hop          = int(window_sec * sr)
         audio_scores = {}
 
         for start in range(0, len(y), hop):
-            end = min(start + hop, len(y))
+            end   = min(start + hop, len(y))
             chunk = y[start:end]
             if len(chunk) < sr * 0.1:
                 continue
 
             t_bucket = round(start / sr, 1)
 
+            # Energy score
             rms = librosa.feature.rms(y=chunk)[0]
             energy_score = min(
                 100, float(np.mean(rms)) * 800)
 
+            # Pitch variation score
             try:
                 pitches, mags = librosa.piptrack(
                     y=chunk, sr=sr)
@@ -232,12 +248,18 @@ def extract_audio_timeline(video_path, window_sec=1.0):
             except Exception:
                 pitch_score = energy_score
 
-            combined = (energy_score * 0.6 +
-                       pitch_score * 0.4)
-            audio_scores[t_bucket] = round(combined, 1)
+            combined = round(
+                energy_score * 0.6 + pitch_score * 0.4, 1)
+            audio_scores[t_bucket] = combined
 
         return audio_scores if audio_scores else None
+
     except Exception:
+        if tmp_audio is not None:
+            try:
+                os.unlink(tmp_audio.name)
+            except Exception:
+                pass
         return None
 
 
