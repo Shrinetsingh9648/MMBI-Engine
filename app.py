@@ -15,9 +15,13 @@ import datetime
 # Audio analysis (optional - gracefully degrades if unavailable)
 try:
     import librosa
-    from moviepy.editor import VideoFileClip
+    try:
+        from moviepy import VideoFileClip
+    except ImportError:
+        from moviepy.editor import VideoFileClip
+    import soundfile
     AUDIO_AVAILABLE = True
-except Exception:
+except Exception as e:
     AUDIO_AVAILABLE = False
 
 # ── PAGE CONFIG ───────────────────────────────────────────
