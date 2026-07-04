@@ -165,21 +165,20 @@ st.markdown("---")
 # ── LOAD MODEL ────────────────────────────────────────────
 @st.cache_resource
 def load_model():
-    # Load model — try relative path first, then absolute
+    import urllib.request, glob
+
+    # ── Load model ────────────────────────────────────────
     model_path = "best_model.h5"
     if not os.path.exists(model_path):
-        # Streamlit Cloud mounts repo at /mount/src/
-        import glob
         found = glob.glob("/mount/src/**/best_model.h5",
                           recursive=True)
         if found:
             model_path = found[0]
     model = tf.keras.models.load_model(model_path)
 
-    # Load class names
+    # ── Load class names ──────────────────────────────────
     cn_path = "class_names.json"
     if not os.path.exists(cn_path):
-        import glob
         found = glob.glob("/mount/src/**/class_names.json",
                           recursive=True)
         if found:
@@ -187,33 +186,26 @@ def load_model():
     with open(cn_path) as f:
         class_names = json.load(f)
 
-    # Load face detector — try multiple paths
+    # ── Load face detector ────────────────────────────────
+    # First: try the file included in the repo itself
     cascade_name = "haarcascade_frontalface_default.xml"
-    cascade_path = cv2.data.haarcascades + cascade_name
+    repo_cascade  = cascade_name
+    found_cascades = glob.glob(
+        f"/mount/src/**/{cascade_name}", recursive=True)
+    if found_cascades:
+        repo_cascade = found_cascades[0]
 
-    if not os.path.exists(cascade_path):
-        # Try common system paths on Linux
-        fallbacks = [
-            f"/usr/share/opencv4/haarcascades/{cascade_name}",
-            f"/usr/share/opencv/haarcascades/{cascade_name}",
-            f"/usr/local/share/opencv4/haarcascades/{cascade_name}",
-            f"/home/adminuser/venv/lib/python3.11/site-packages/cv2/data/{cascade_name}",
-        ]
-        for fb in fallbacks:
-            if os.path.exists(fb):
-                cascade_path = fb
-                break
-
-    face_det = cv2.CascadeClassifier(cascade_path)
-
-    if face_det.empty():
-        # Last resort — download it
-        import urllib.request
-        url = ("https://raw.githubusercontent.com/opencv/opencv/"
-               "master/data/haarcascades/"
-               "haarcascade_frontalface_default.xml")
-        local = "/tmp/haarcascade_frontalface_default.xml"
-        urllib.request.urlretrieve(url, local)
+    if os.path.exists(repo_cascade):
+        face_det = cv2.CascadeClassifier(repo_cascade)
+    else:
+        # Fallback: download from OpenCV GitHub
+        local = f"/tmp/{cascade_name}"
+        urllib.request.urlretrieve(
+            "https://raw.githubusercontent.com/opencv/opencv"
+            "/master/data/haarcascades/"
+            + cascade_name,
+            local
+        )
         face_det = cv2.CascadeClassifier(local)
 
     return model, class_names, face_det
