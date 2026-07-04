@@ -165,13 +165,57 @@ st.markdown("---")
 # ── LOAD MODEL ────────────────────────────────────────────
 @st.cache_resource
 def load_model():
-    model = tf.keras.models.load_model("best_model.h5")
-    with open("class_names.json") as f:
+    # Load model — try relative path first, then absolute
+    model_path = "best_model.h5"
+    if not os.path.exists(model_path):
+        # Streamlit Cloud mounts repo at /mount/src/
+        import glob
+        found = glob.glob("/mount/src/**/best_model.h5",
+                          recursive=True)
+        if found:
+            model_path = found[0]
+    model = tf.keras.models.load_model(model_path)
+
+    # Load class names
+    cn_path = "class_names.json"
+    if not os.path.exists(cn_path):
+        import glob
+        found = glob.glob("/mount/src/**/class_names.json",
+                          recursive=True)
+        if found:
+            cn_path = found[0]
+    with open(cn_path) as f:
         class_names = json.load(f)
-    face_det = cv2.CascadeClassifier(
-        cv2.data.haarcascades +
-        "haarcascade_frontalface_default.xml"
-    )
+
+    # Load face detector — try multiple paths
+    cascade_name = "haarcascade_frontalface_default.xml"
+    cascade_path = cv2.data.haarcascades + cascade_name
+
+    if not os.path.exists(cascade_path):
+        # Try common system paths on Linux
+        fallbacks = [
+            f"/usr/share/opencv4/haarcascades/{cascade_name}",
+            f"/usr/share/opencv/haarcascades/{cascade_name}",
+            f"/usr/local/share/opencv4/haarcascades/{cascade_name}",
+            f"/home/adminuser/venv/lib/python3.11/site-packages/cv2/data/{cascade_name}",
+        ]
+        for fb in fallbacks:
+            if os.path.exists(fb):
+                cascade_path = fb
+                break
+
+    face_det = cv2.CascadeClassifier(cascade_path)
+
+    if face_det.empty():
+        # Last resort — download it
+        import urllib.request
+        url = ("https://raw.githubusercontent.com/opencv/opencv/"
+               "master/data/haarcascades/"
+               "haarcascade_frontalface_default.xml")
+        local = "/tmp/haarcascade_frontalface_default.xml"
+        urllib.request.urlretrieve(url, local)
+        face_det = cv2.CascadeClassifier(local)
+
     return model, class_names, face_det
 
 INTEREST_MAP = {
@@ -191,24 +235,21 @@ def extract_audio_timeline(video_path, window_sec=1.0):
 
     tmp_audio = None
     try:
-        # Use ffmpeg directly — always available on Streamlit Cloud
-        tmp_audio = tempfile.NamedTemporaryFile(
-            delete=False, suffix=".wav")
-        tmp_name  = tmp_audio.name
-        tmp_audio.close()
+        import subprocess
+        # Use /tmp for reliable write access
+        tmp_name = '/tmp/mmbi_audio_extract.wav'
 
-        ret = os.system(
-            f'ffmpeg -y -i "{video_path}" '
-            f'-ac 1 -ar 22050 '
-            f'-vn "{tmp_name}" '
-            f'-loglevel error'
+        result = subprocess.run(
+            ['ffmpeg', '-y', '-i', video_path,
+             '-ac', '1', '-ar', '22050',
+             '-vn', tmp_name,
+             '-loglevel', 'quiet'],
+            capture_output=True, timeout=120
         )
 
-        if ret != 0 or not os.path.exists(tmp_name):
+        if not os.path.exists(tmp_name):
             return None
-
-        file_size = os.path.getsize(tmp_name)
-        if file_size < 1000:
+        if os.path.getsize(tmp_name) < 1000:
             return None
 
         y, sr = librosa.load(tmp_name, sr=22050)
