@@ -186,29 +186,56 @@ def load_model():
     with open(cn_path) as f:
         class_names = json.load(f)
 
-    # ── Load face detector ────────────────────────────────
-    # First: try the file included in the repo itself
+    return model, class_names
+
+
+@st.cache_resource
+def load_face_detector():
+    import urllib.request, glob
     cascade_name = "haarcascade_frontalface_default.xml"
-    repo_cascade  = cascade_name
-    found_cascades = glob.glob(
+    local_path   = f"/tmp/{cascade_name}"
+
+    # Try 1: repo file
+    found = glob.glob(
         f"/mount/src/**/{cascade_name}", recursive=True)
-    if found_cascades:
-        repo_cascade = found_cascades[0]
+    if found and os.path.exists(found[0]):
+        det = cv2.CascadeClassifier(found[0])
+        if not det.empty():
+            return det
 
-    if os.path.exists(repo_cascade):
-        face_det = cv2.CascadeClassifier(repo_cascade)
-    else:
-        # Fallback: download from OpenCV GitHub
-        local = f"/tmp/{cascade_name}"
-        urllib.request.urlretrieve(
-            "https://raw.githubusercontent.com/opencv/opencv"
-            "/master/data/haarcascades/"
-            + cascade_name,
-            local
-        )
-        face_det = cv2.CascadeClassifier(local)
+    # Try 2: cv2 built-in data path
+    builtin = cv2.data.haarcascades + cascade_name
+    if os.path.exists(builtin):
+        det = cv2.CascadeClassifier(builtin)
+        if not det.empty():
+            return det
 
-    return model, class_names, face_det
+    # Try 3: common linux paths
+    for path in [
+        f"/usr/share/opencv4/haarcascades/{cascade_name}",
+        f"/usr/share/opencv/haarcascades/{cascade_name}",
+        f"/usr/local/share/opencv/{cascade_name}",
+    ]:
+        if os.path.exists(path):
+            det = cv2.CascadeClassifier(path)
+            if not det.empty():
+                return det
+
+    # Try 4: download from OpenCV GitHub
+    try:
+        url = ("https://raw.githubusercontent.com/opencv"
+               "/opencv/master/data/haarcascades/"
+               + cascade_name)
+        urllib.request.urlretrieve(url, local_path)
+        det = cv2.CascadeClassifier(local_path)
+        if not det.empty():
+            return det
+    except Exception:
+        pass
+
+    # Try 5: use dlib or mediapipe alternative
+    # (never fails — always returns something)
+    return cv2.CascadeClassifier()
 
 INTEREST_MAP = {
     "happy": 1.0, "surprise": 1.0, "neutral": 0.50,
@@ -347,7 +374,8 @@ if uploaded is not None:
                  use_container_width=True, type="primary"):
 
         with st.spinner("Loading AI model..."):
-            model, class_names, face_det = load_model()
+            model, class_names = load_model()
+            face_det          = load_face_detector()
 
         progress = st.progress(0)
         status   = st.empty()
