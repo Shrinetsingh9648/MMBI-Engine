@@ -444,16 +444,8 @@ if uploaded is not None:
                 st.info("🔊 Audio detected — fusing voice "
                         "energy with facial analysis")
             else:
-                import subprocess
-                probe = subprocess.run(
-                    ["ffmpeg", "-i", video_path],
-                    capture_output=True, text=True
-                )
-                has_audio = "Audio:" in probe.stderr
-                st.caption(
-                    f"ℹ️ {'Video has audio but extraction failed'
-                    if has_audio else 'No audio track found'} — "
-                    "using facial expression only")
+                st.caption("ℹ️ No usable audio track found — "
+                           "using facial expression only")
         else:
             st.caption("ℹ️ Audio analysis not available in "
                        "this environment — using facial "
