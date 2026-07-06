@@ -15,10 +15,7 @@ import datetime
 # Audio analysis (optional - gracefully degrades if unavailable)
 try:
     import librosa
-    try:
-        from moviepy import VideoFileClip
-    except ImportError:
-        from moviepy.editor import VideoFileClip
+    import soundfile
     AUDIO_AVAILABLE = True
 except Exception:
     AUDIO_AVAILABLE = False
