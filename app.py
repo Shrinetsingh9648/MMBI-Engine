@@ -12,13 +12,7 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
 import datetime
 
-# Audio analysis (optional - gracefully degrades if unavailable)
-try:
-    import librosa
-    import soundfile
-    AUDIO_AVAILABLE = True
-except Exception:
-    AUDIO_AVAILABLE = False
+AUDIO_AVAILABLE = False
 
 # ── PAGE CONFIG ───────────────────────────────────────────
 st.set_page_config(
@@ -239,97 +233,6 @@ INTEREST_MAP = {
     "fear": 0.40, "sad": 0.25, "angry": 0.1, "disgust": 0.1,
 }
 
-# ── AUDIO ANALYSIS ────────────────────────────────────────
-def extract_audio_timeline(video_path, window_sec=1.0):
-    """
-    Extracts per-second audio energy + pitch variation.
-    Uses ffmpeg (always available) instead of moviepy.
-    Returns dict {time_bucket: score} or None.
-    """
-    if not AUDIO_AVAILABLE:
-        return None
-
-    tmp_audio = None
-    try:
-        import subprocess
-        # Use /tmp for reliable write access
-        tmp_name = '/tmp/mmbi_audio_extract.wav'
-
-        result = subprocess.run(
-            ['ffmpeg', '-y', '-i', video_path,
-             '-ac', '1', '-ar', '22050',
-             '-vn', tmp_name,
-             '-loglevel', 'quiet'],
-            capture_output=True, timeout=120
-        )
-
-        if not os.path.exists(tmp_name):
-            return None
-        if os.path.getsize(tmp_name) < 1000:
-            return None
-
-        y, sr = librosa.load(tmp_name, sr=22050)
-
-        try:
-            os.unlink(tmp_name)
-        except Exception:
-            pass
-
-        if len(y) < sr * 0.5:
-            return None
-
-        hop          = int(window_sec * sr)
-        audio_scores = {}
-
-        for start in range(0, len(y), hop):
-            end   = min(start + hop, len(y))
-            chunk = y[start:end]
-            if len(chunk) < sr * 0.1:
-                continue
-
-            t_bucket = round(start / sr, 1)
-
-            # Energy score
-            rms = librosa.feature.rms(y=chunk)[0]
-            energy_score = min(
-                100, float(np.mean(rms)) * 800)
-
-            # Pitch variation score
-            try:
-                pitches, mags = librosa.piptrack(
-                    y=chunk, sr=sr)
-                valid = pitches[mags > np.median(mags)]
-                pitch_var = (float(np.std(valid))
-                             if len(valid) > 0 else 0)
-                pitch_score = min(100, pitch_var / 8)
-            except Exception:
-                pitch_score = energy_score
-
-            combined = round(
-                energy_score * 0.6 + pitch_score * 0.4, 1)
-            audio_scores[t_bucket] = combined
-
-        return audio_scores if audio_scores else None
-
-    except Exception:
-        if tmp_audio is not None:
-            try:
-                os.unlink(tmp_audio.name)
-            except Exception:
-                pass
-        return None
-
-
-def get_audio_score_at(audio_scores, t, window_sec=1.0):
-    """Look up nearest audio score bucket for a given time."""
-    if not audio_scores:
-        return None
-    bucket = round(t / window_sec) * window_sec
-    if bucket in audio_scores:
-        return audio_scores[bucket]
-    nearest = min(audio_scores.keys(),
-                  key=lambda k: abs(k - t))
-    return audio_scores[nearest]
 
 
 # ── SIDEBAR ───────────────────────────────────────────────
@@ -435,21 +338,7 @@ if uploaded is not None:
                     fimg, caption=f"Person {pid}",
                     use_column_width=True)
 
-        # ── AUDIO ANALYSIS ────────────────────────────────
         audio_scores = None
-        if AUDIO_AVAILABLE:
-            status.text("🔊 Analyzing audio track...")
-            audio_scores = extract_audio_timeline(video_path)
-            if audio_scores:
-                st.info("🔊 Audio detected — fusing voice "
-                        "energy with facial analysis")
-            else:
-                st.caption("ℹ️ No usable audio track found — "
-                           "using facial expression only")
-        else:
-            st.caption("ℹ️ Audio analysis not available in "
-                       "this environment — using facial "
-                       "expression only")
 
         status.text("🎬 Analyzing video frame by frame...")
         timelines = {pid: [] for pid in people.keys()}
@@ -490,21 +379,9 @@ if uploaded is not None:
                     face_score = round(
                         INTEREST_MAP.get(emotion, 0.5) * 100, 1)
 
-                    # Fuse with audio if available
-                    audio_score = get_audio_score_at(
-                        audio_scores, ts) if audio_scores else None
-                    if audio_score is not None:
-                        final_score = round(
-                            face_score * 0.6 +
-                            audio_score * 0.4, 1)
-                    else:
-                        final_score = face_score
-
                     timelines[best_pid].append({
                         "time": round(ts, 2),
-                        "score": final_score,
-                        "face_score": face_score,
-                        "audio_score": audio_score,
+                        "score": face_score,
                         "conf": conf,
                     })
             progress.progress(min(int(fcount/total*100), 100))
