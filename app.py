@@ -358,11 +358,10 @@ uploaded = st.file_uploader(
 )
 
 if uploaded is not None:
-    tmp = tempfile.NamedTemporaryFile(
-        delete=False, suffix=".mp4")
-    tmp.write(uploaded.read())
-    tmp.close()
-    video_path = tmp.name
+    # Save to fixed /tmp path so ffmpeg can always find it
+    video_path = "/tmp/mmbi_upload.mp4"
+    with open(video_path, "wb") as f:
+        f.write(uploaded.read())
 
     st.video(uploaded)
     st.markdown("---")
@@ -445,8 +444,16 @@ if uploaded is not None:
                 st.info("🔊 Audio detected — fusing voice "
                         "energy with facial analysis")
             else:
-                st.caption("ℹ️ No usable audio track found — "
-                           "using facial expression only")
+                import subprocess
+                probe = subprocess.run(
+                    ["ffmpeg", "-i", video_path],
+                    capture_output=True, text=True
+                )
+                has_audio = "Audio:" in probe.stderr
+                st.caption(
+                    f"ℹ️ {'Video has audio but extraction failed'
+                    if has_audio else 'No audio track found'} — "
+                    "using facial expression only")
         else:
             st.caption("ℹ️ Audio analysis not available in "
                        "this environment — using facial "
