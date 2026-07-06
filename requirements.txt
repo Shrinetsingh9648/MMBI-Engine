@@ -5,5 +5,3 @@ numpy
 pandas
 matplotlib
 reportlab
-librosa
-soundfile
