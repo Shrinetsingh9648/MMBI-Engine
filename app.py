@@ -238,7 +238,7 @@ INTEREST_MAP = {
 # ── SIDEBAR ───────────────────────────────────────────────
 with st.sidebar:
     st.markdown("### ⚙️ Settings")
-    max_people = st.slider("Max people to track", 1, 4, 2)
+    max_people = st.slider("Max people to track", 1, 2, 3, 4)
     scan_secs  = st.slider("Scan duration (seconds)", 5, 30, 10)
     threshold  = st.slider("Detection sensitivity", 0.3, 0.7, 0.4)
     st.markdown("---")
@@ -246,8 +246,8 @@ with st.sidebar:
     st.markdown(
         "MMBI Engine analyzes facial expressions to "
         "predict viewer interest in product review "
-        "videos — helping brands understand real "
-        "audience engagement."
+        "videos — helping brands understand real. "
+        
     )
     st.markdown("---")
     st.caption("Built with TensorFlow + OpenCV")
@@ -256,7 +256,7 @@ with st.sidebar:
 st.markdown("### 📤 Upload Your Video")
 uploaded = st.file_uploader(
     "Drop a product review video here",
-    type=["mp4", "avi", "mov"],
+    type=["avi", "mov"],
     label_visibility="collapsed"
 )
 
