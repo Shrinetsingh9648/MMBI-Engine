@@ -238,7 +238,7 @@ INTEREST_MAP = {
 # ── SIDEBAR ───────────────────────────────────────────────
 with st.sidebar:
     st.markdown("### ⚙️ Settings")
-    max_people = st.slider("Max people to track", 4, 1, 2)
+    max_people = st.slider("Max people to track", 4, 1, 4)
     scan_secs  = st.slider("Scan duration (seconds)", 5, 30, 10)
     threshold  = st.slider("Detection sensitivity", 0.3, 0.7, 0.4)
     st.markdown("---")
