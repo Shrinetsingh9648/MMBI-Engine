@@ -256,7 +256,7 @@ with st.sidebar:
 st.markdown("### 📤 Upload Your Video")
 uploaded = st.file_uploader(
     "Drop a product review video here",
-    type=["avi", "mov"],
+    type=["mp4", avi", "mov"],
     label_visibility="collapsed"
 )
 
