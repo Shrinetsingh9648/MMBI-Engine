@@ -109,10 +109,23 @@ PERSON_COLORS_PLT = ["#00c8ff", "#ff6400", "#00ff64", "#ff00c8"]
 
 
 def predict_emotion(model, class_names, face_roi_bgr):
+    # Guard against degenerate crops (zero width/height near frame edges) —
+    # these would otherwise reach the model with a broken shape and crash it.
+    if face_roi_bgr is None or face_roi_bgr.size == 0 or 0 in face_roi_bgr.shape[:2]:
+        return None, 0.0, None
+
     roi_rgb = cv2.cvtColor(face_roi_bgr, cv2.COLOR_BGR2RGB)
     roi_resized = cv2.resize(roi_rgb, IMG_SIZE)
     roi_in = preprocess_input(roi_resized.astype("float32"))
     roi_in = np.expand_dims(roi_in, axis=0)
+
+    # One-time debug print of the shape actually being sent in vs. what the
+    # model expects — check "Manage app" > Logs on Streamlit Cloud if a
+    # ValueError still occurs, this line will show the real mismatch.
+    if not st.session_state.get("_shape_logged", False):
+        print(f"[MMBI DEBUG] model.input_shape={model.input_shape}  roi_in.shape={roi_in.shape}")
+        st.session_state["_shape_logged"] = True
+
     preds = model.predict(roi_in, verbose=0)[0]
     idx = int(np.argmax(preds))
     return class_names[idx], float(preds[idx]), roi_resized
@@ -310,7 +323,15 @@ if uploaded is not None:
                     if best_pid is None: continue
 
                     face_roi_bgr = frame[y:y+h, x:x+w]
-                    emotion, conf, face_rgb_96 = predict_emotion(model, class_names, face_roi_bgr)
+                    try:
+                        emotion, conf, face_rgb_96 = predict_emotion(model, class_names, face_roi_bgr)
+                    except Exception as e:
+                        # Don't let one bad frame crash the whole analysis —
+                        # log it and just skip this detection.
+                        print(f"[MMBI DEBUG] predict_emotion failed: {e}")
+                        continue
+                    if emotion is None:
+                        continue  # degenerate crop, skip
                     if conf < 0.45: emotion = "neutral"
                     ew    = INTEREST_MAP.get(emotion, 0.5)
                     score = round(ew*100, 1)
