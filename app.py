@@ -193,6 +193,8 @@ with st.sidebar:
     threshold  = st.slider("Detection sensitivity", 0.3, 0.7, 0.4)
     show_gradcam = st.checkbox("🔥 Show Grad-CAM explanations", value=True,
                                 help="Highlights which parts of each face the AI focused on for its top prediction")
+    generate_pdf = st.checkbox("📄 Generate PDF report", value=False,
+                                help="Off by default — PDF generation adds extra processing time. Turn on if you need a downloadable report.")
 
     st.markdown("---")
     st.markdown("## ℹ️ How it works")
@@ -357,12 +359,43 @@ if uploaded is not None:
         st.markdown("---")
         st.markdown("## 📊 Results")
 
+        # Precompute each person's smoothed dataframe once, reused below
+        person_dfs = {}
+        for pid, tl in timelines.items():
+            if not tl: continue
+            df = pd.DataFrame(tl)
+            df["sm"] = df["score"].rolling(30, min_periods=1).mean()
+            person_dfs[pid] = df
+
+        # ── Combined chart: everyone's timeline on one graph ──
+        if len(person_dfs) > 0:
+            st.markdown("### 🆚 All People — Combined Timeline")
+            figc, axc = plt.subplots(figsize=(12,4.5))
+            figc.patch.set_facecolor("#1a1a2e")
+            axc.set_facecolor("#16213e")
+            axc.fill_between([0, max(df["time"].max() for df in person_dfs.values())], 65,100,alpha=0.10,color="green")
+            axc.fill_between([0, max(df["time"].max() for df in person_dfs.values())], 40,65,alpha=0.10,color="yellow")
+            axc.fill_between([0, max(df["time"].max() for df in person_dfs.values())], 0,40,alpha=0.10,color="red")
+            for pid, df in person_dfs.items():
+                axc.plot(df["time"], df["sm"], color=PERSON_COLORS_PLT[pid-1], lw=2.5, label=f"Person {pid}")
+            axc.axhline(65, color="green", lw=0.8, ls="--")
+            axc.axhline(40, color="orange", lw=0.8, ls="--")
+            axc.set_xlim(0, max(df["time"].max() for df in person_dfs.values()))
+            axc.set_ylim(0,100)
+            axc.set_xlabel("Time(s)", color="white")
+            axc.set_ylabel("Interest Score", color="white")
+            axc.tick_params(colors="white")
+            legend = axc.legend(facecolor="#1a1a2e", labelcolor="white")
+            for sp in axc.spines.values(): sp.set_edgecolor("#555")
+            st.pyplot(figc)
+            plt.close()
+            st.markdown("---")
+
         pdf_data = {}
         for pid, tl in timelines.items():
             if not tl: continue
             st.markdown(f"### Person {pid}")
-            df = pd.DataFrame(tl)
-            df["sm"] = df["score"].rolling(30, min_periods=1).mean()
+            df = person_dfs[pid]
             scores = df["score"].values
             avg   = np.mean(scores)
             inter = np.mean(scores>=65)*100
@@ -467,46 +500,55 @@ if uploaded is not None:
             st.pyplot(fig3)
             plt.close()
 
-        # ── PDF report ──────────────────────────────────────
-        pdf_path = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf").name
-        c = canvas.Canvas(pdf_path, pagesize=A4)
-        W, H = A4
-        c.setFillColorRGB(0.05,0.05,0.3)
-        c.rect(0,H-80,W,80,fill=1,stroke=0)
-        c.setFont("Helvetica-Bold",22)
-        c.setFillColor(colors.white)
-        c.drawString(40,H-45,"MMBI Engine Report")
-        c.setFont("Helvetica",11)
-        c.drawString(40,H-65, f"Video: {uploaded.name}  |  Date: {datetime.datetime.now().strftime('%d %b %Y %H:%M')}")
-        y = H-110
-        for pid, d in pdf_data.items():
-            c.setFillColorRGB(0.1,0.1,0.5)
-            c.rect(30,y-5,W-60,30,fill=1,stroke=0)
-            c.setFont("Helvetica-Bold",14)
-            c.setFillColor(colors.white)
-            c.drawString(40,y+8,f"Person {pid}")
-            y -= 45
-            c.setFont("Helvetica",11)
-            c.setFillColor(colors.black)
-            for label, val in [
-                ("Average Score", f"{d['avg']:.1f}/100"),
-                ("Interested", f"{d['inter']:.1f}%"),
-                ("Neutral", f"{d['neut']:.1f}%"),
-                ("Not Interested", f"{d['not_i']:.1f}%"),
-                ("Peak Interest", f"{d['peak']:.0f}% at {d['peak_t']:.1f}s"),
-            ]:
-                c.drawString(50,y,f"{label}: {val}")
-                y -= 20
-            y -= 20
-        c.save()
+        # ── PDF report — optional, only runs if the sidebar checkbox is on ──
+        if generate_pdf:
+            st.markdown("---")
+            try:
+                pdf_path = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf").name
+                c = canvas.Canvas(pdf_path, pagesize=A4)
+                W, H = A4
+                c.setFillColorRGB(0.05,0.05,0.3)
+                c.rect(0,H-80,W,80,fill=1,stroke=0)
+                c.setFont("Helvetica-Bold",22)
+                c.setFillColor(colors.white)
+                c.drawString(40,H-45,"MMBI Engine Report")
+                c.setFont("Helvetica",11)
+                c.drawString(40,H-65, f"Video: {uploaded.name}  |  Date: {datetime.datetime.now().strftime('%d %b %Y %H:%M')}")
+                y = H-110
+                for pid, d in pdf_data.items():
+                    c.setFillColorRGB(0.1,0.1,0.5)
+                    c.rect(30,y-5,W-60,30,fill=1,stroke=0)
+                    c.setFont("Helvetica-Bold",14)
+                    c.setFillColor(colors.white)
+                    c.drawString(40,y+8,f"Person {pid}")
+                    y -= 45
+                    c.setFont("Helvetica",11)
+                    c.setFillColor(colors.black)
+                    for label, val in [
+                        ("Average Score", f"{d['avg']:.1f}/100"),
+                        ("Interested", f"{d['inter']:.1f}%"),
+                        ("Neutral", f"{d['neut']:.1f}%"),
+                        ("Not Interested", f"{d['not_i']:.1f}%"),
+                        ("Peak Interest", f"{d['peak']:.0f}% at {d['peak_t']:.1f}s"),
+                    ]:
+                        c.drawString(50,y,f"{label}: {val}")
+                        y -= 20
+                    y -= 20
+                c.save()
 
-        with open(pdf_path, "rb") as f:
-            st.download_button(
-                "📄 Download PDF Report", f,
-                file_name=f"MMBI_Engine_Report_{uploaded.name}.pdf",
-                mime="application/pdf",
-                use_container_width=True
-            )
+                with open(pdf_path, "rb") as f:
+                    st.download_button(
+                        "📄 Download PDF Report", f,
+                        file_name=f"MMBI_Engine_Report_{uploaded.name}.pdf",
+                        mime="application/pdf",
+                        use_container_width=True
+                    )
+            except Exception as e:
+                # Surface the real error instead of failing silently or crashing the app
+                st.error(f"PDF generation failed: {e}")
+                print(f"[MMBI DEBUG] PDF generation failed: {e}")
+        else:
+            st.info("📄 PDF report generation is off. Enable it in the sidebar if you want a downloadable report.")
 
         os.unlink(video_path)
         st.success("✅ Analysis complete!")
