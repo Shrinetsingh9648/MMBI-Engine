@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
+import mediapipe as mp
 import tensorflow as tf
 from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
 import json
@@ -68,7 +69,7 @@ st.markdown("""
 
 col1, col2, col3, col4 = st.columns(4)
 for col, icon, title, desc in [
-    (col1, "🎭", "Emotion Detection", "MobileNetV2, 65% test accuracy on FER-2013"),
+    (col1, "🎭", "Emotion Detection", "MobileNetV2, 75.8% test accuracy on FER+"),
     (col2, "🔥", "Grad-CAM Explainability", "See exactly what the AI is looking at"),
     (col3, "📊", "Interest Timeline", "See exactly when interest peaks or drops"),
     (col4, "📄", "PDF Reports", "Professional reports ready to share"),
@@ -95,10 +96,35 @@ def load_model():
     model = tf.keras.models.load_model("best_model.h5")
     with open("class_names.json") as f:
         class_names = json.load(f)
-    face_det = cv2.CascadeClassifier(
-        cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+    # MediaPipe Face Detection — tighter, more accurate crops than Haar
+    # cascades, which often clip faces off-center or include background.
+    face_det = mp.solutions.face_detection.FaceDetection(
+        model_selection=1, min_detection_confidence=0.5
     )
     return model, class_names, face_det
+
+
+def detect_faces(face_det, frame_bgr):
+    """
+    Runs MediaPipe face detection on a BGR frame and returns a list of
+    (x, y, w, h) pixel boxes — same shape the rest of the app already
+    expects, so the multi-person tracking logic below didn't need to change.
+    """
+    h, w = frame_bgr.shape[:2]
+    rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    results = face_det.process(rgb)
+    boxes = []
+    if results.detections:
+        for det in results.detections:
+            bbox = det.location_data.relative_bounding_box
+            x = max(0, int(bbox.xmin * w))
+            y = max(0, int(bbox.ymin * h))
+            bw = min(int(bbox.width * w), w - x)
+            bh = min(int(bbox.height * h), h - y)
+            if bw > 0 and bh > 0:
+                boxes.append((x, y, bw, bh))
+    return boxes
+
 
 INTEREST_MAP = {
     "happy": 1.0, "surprise": 1.0, "neutral": 0.75,
@@ -244,10 +270,11 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("## 📈 Model Benchmark")
     st.markdown("""
-    **Test accuracy: 65.0%** on FER-2013 (7-class)
-    - Happy: 88% precision
-    - Surprise: 75% precision
-    - Fear / Sad: weakest classes (dataset-wide known issue)
+    **Test accuracy: 75.8%** on FER+ (7-class)
+    - Happy: 87.6% precision
+    - Neutral: 81.9% precision
+    - Surprise: 75.9% precision
+    - Fear / Sad / Disgust: weakest classes (dataset-wide known issue — low sample counts and inherent visual overlap between these expressions)
     """)
 
     st.markdown("---")
@@ -298,7 +325,7 @@ if uploaded is not None:
             ret, frame = cap.read()
             if not ret: break
             gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            faces = face_det.detectMultiScale(gray, 1.1, 10, minSize=(100,100))
+            faces = detect_faces(face_det, frame)
             for (x,y,w,h) in faces:
                 gray_roi  = gray[y:y+h, x:x+w].copy()
                 face_size = w * h
@@ -346,7 +373,7 @@ if uploaded is not None:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
             if fcount % 2 == 0:
-                faces = face_det.detectMultiScale(gray, 1.3, 5, minSize=(40,40))
+                faces = detect_faces(face_det, frame)
                 for (x,y,w,h) in faces:
                     gray_roi = gray[y:y+h, x:x+w]
                     curr_h   = cv2.calcHist([gray_roi],[0],None,[256],[0,256])
@@ -598,6 +625,6 @@ if uploaded is not None:
 st.markdown("""
 <div class="footer">
     🎯 MMBI Engine — AI-Powered Audience Engagement Analytics<br>
-    Built with TensorFlow, OpenCV & Streamlit &nbsp;|&nbsp; Model: MobileNetV2, 65.0% test accuracy (FER-2013)
+    Built with TensorFlow, OpenCV & Streamlit &nbsp;|&nbsp; Model: MobileNetV2, 75.8% test accuracy (FER+)
 </div>
 """, unsafe_allow_html=True)
