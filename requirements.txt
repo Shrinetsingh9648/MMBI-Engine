@@ -1,6 +1,7 @@
 streamlit
 opencv-python-headless==4.10.0.84
 tensorflow>=2.19,<2.21
+mediapipe
 numpy
 pandas
 matplotlib
