@@ -150,14 +150,47 @@ def find_backbone_and_last_conv(model):
 
 @st.cache_resource
 def build_gradcam_model(_model):
+    """
+    Keras 3 treats a nested sub-model (like our MobileNetV2 backbone) as an
+    opaque callable — pulling a tensor out of its internal graph (the old
+    approach) produces a graph that isn't connected to the outer model's
+    inputs, and raises "Output ... is not connected to inputs".
+
+    Fix: rebuild the forward pass explicitly on fresh Input tensors —
+    1) a standalone model for the backbone up to its last conv layer
+    2) manually replay the remaining "head" layers (GAP, Dropout, Dense, etc.)
+    This produces a properly connected graph regardless of nesting.
+    """
     backbone, conv_name = find_backbone_and_last_conv(_model)
     if backbone is None:
         return None
-    grad_model = tf.keras.models.Model(
-        inputs=_model.inputs,
-        outputs=[backbone.get_layer(conv_name).output, _model.output],
-    )
-    return grad_model
+
+    try:
+        # Standalone backbone-up-to-last-conv model (has its own clean graph)
+        grad_backbone = tf.keras.Model(
+            inputs=backbone.input,
+            outputs=backbone.get_layer(conv_name).output,
+        )
+
+        inputs = tf.keras.Input(shape=_model.input_shape[1:])
+        conv_output = grad_backbone(inputs)
+
+        # Replay every layer that comes AFTER the backbone in the outer model
+        x = conv_output
+        found_backbone = False
+        for layer in _model.layers:
+            if layer is backbone:
+                found_backbone = True
+                continue
+            if not found_backbone:
+                continue  # skip the Input layer and anything before/including backbone
+            x = layer(x)
+
+        grad_model = tf.keras.Model(inputs, [conv_output, x])
+        return grad_model
+    except Exception as e:
+        print(f"[MMBI DEBUG] build_gradcam_model failed: {e}")
+        return None
 
 
 def make_gradcam_heatmap(grad_model, img_array, pred_index):
@@ -171,6 +204,7 @@ def make_gradcam_heatmap(grad_model, img_array, pred_index):
     heatmap = tf.squeeze(heatmap)
     heatmap = tf.maximum(heatmap, 0) / (tf.math.reduce_max(heatmap) + 1e-8)
     return heatmap.numpy()
+
 
 
 def overlay_heatmap(face_rgb_96, heatmap, alpha=0.45):
@@ -471,7 +505,12 @@ if uploaded is not None:
                     except Exception as e:
                         st.info(f"Grad-CAM unavailable for this model architecture ({e})")
                 else:
-                    st.info("Enable 'Show Grad-CAM explanations' in the sidebar to see this.")
+                    if not show_gradcam:
+                        st.info("Enable 'Show Grad-CAM explanations' in the sidebar to see this.")
+                    elif grad_model is None:
+                        st.info("Grad-CAM couldn't be built for this model — see app logs for details.")
+                    else:
+                        st.info("No confident frame available yet for this person.")
 
             # ── CSV export of raw timeline ──
             csv_data = df[["time","score","emotion"]].to_csv(index=False).encode("utf-8")
