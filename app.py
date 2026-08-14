@@ -359,29 +359,51 @@ if uploaded is not None:
             for (x,y,w,h) in faces:
                 gray_roi  = gray[y:y+h, x:x+w].copy()
                 face_size = w * h
-                matched_id, best_sim = None, threshold
+                matched_id = None
+
+                # 1) SPATIAL CONTINUITY (primary signal): a face can't jump far
+                # between consecutive frames, so overlap with a person's last
+                # known position is a much more reliable match than appearance —
+                # brightness histograms drift too easily with pose/lighting change.
+                best_iou = 0.25
                 for pid, pdata in people.items():
                     if pid in used_pids_this_frame:
                         continue
-                    curr_h = cv2.calcHist([gray_roi],[0],None,[256],[0,256])
-                    cv2.normalize(curr_h, curr_h)
-                    sim = cv2.compareHist(pdata["hist"], curr_h, cv2.HISTCMP_CORREL)
-                    if sim > best_sim:
-                        best_sim, matched_id = sim, pid
+                    iou = _iou((x,y,w,h), pdata["last_box"])
+                    if iou > best_iou:
+                        best_iou, matched_id = iou, pid
+
+                # 2) Fallback to appearance histogram — only used when there's no
+                # spatial match (e.g. this person's first sighting this scan, or
+                # they briefly left frame and are re-appearing).
+                if matched_id is None:
+                    best_sim = threshold
+                    for pid, pdata in people.items():
+                        if pid in used_pids_this_frame:
+                            continue
+                        curr_h = cv2.calcHist([gray_roi],[0],None,[256],[0,256])
+                        cv2.normalize(curr_h, curr_h)
+                        sim = cv2.compareHist(pdata["hist"], curr_h, cv2.HISTCMP_CORREL)
+                        if sim > best_sim:
+                            best_sim, matched_id = sim, pid
+
                 if matched_id is not None:
                     used_pids_this_frame.add(matched_id)
-                    if face_size > people[matched_id]["size"]:
+                    pdata = people[matched_id]
+                    pdata["last_box"] = (x,y,w,h)  # always update position for next-frame continuity
+                    if face_size > pdata["size"]:
                         h_roi = cv2.calcHist([gray_roi],[0],None,[256],[0,256])
                         cv2.normalize(h_roi, h_roi)
-                        people[matched_id] = {"face": (x,y,w,h), "gray_roi": gray_roi,
-                                               "frame": frame.copy(), "size": face_size, "hist": h_roi}
+                        pdata.update(face=(x,y,w,h), gray_roi=gray_roi, frame=frame.copy(),
+                                     size=face_size, hist=h_roi)
                 else:
                     if len(people) < max_people:
                         pid = len(people) + 1
                         h_roi = cv2.calcHist([gray_roi],[0],None,[256],[0,256])
                         cv2.normalize(h_roi, h_roi)
                         people[pid] = {"face": (x,y,w,h), "gray_roi": gray_roi,
-                                        "frame": frame.copy(), "size": face_size, "hist": h_roi}
+                                        "frame": frame.copy(), "size": face_size, "hist": h_roi,
+                                        "last_box": (x,y,w,h)}
                         used_pids_this_frame.add(pid)
         cap.release()
 
@@ -411,17 +433,32 @@ if uploaded is not None:
                 used_pids_this_frame = set()  # prevents two faces in the same frame claiming the same person
                 for (x,y,w,h) in faces:
                     gray_roi = gray[y:y+h, x:x+w]
-                    curr_h   = cv2.calcHist([gray_roi],[0],None,[256],[0,256])
-                    cv2.normalize(curr_h, curr_h)
-                    best_pid, best_sim = None, 0.35
+                    best_pid = None
+
+                    # 1) Spatial continuity first — same reasoning as the scan phase above
+                    best_iou = 0.25
                     for pid, pdata in people.items():
                         if pid in used_pids_this_frame:
                             continue
-                        sim = cv2.compareHist(pdata["hist"], curr_h, cv2.HISTCMP_CORREL)
-                        if sim > best_sim:
-                            best_sim, best_pid = sim, pid
+                        iou = _iou((x,y,w,h), pdata["last_box"])
+                        if iou > best_iou:
+                            best_iou, best_pid = iou, pid
+
+                    # 2) Fallback to appearance histogram if no spatial match
+                    if best_pid is None:
+                        curr_h = cv2.calcHist([gray_roi],[0],None,[256],[0,256])
+                        cv2.normalize(curr_h, curr_h)
+                        best_sim = 0.35
+                        for pid, pdata in people.items():
+                            if pid in used_pids_this_frame:
+                                continue
+                            sim = cv2.compareHist(pdata["hist"], curr_h, cv2.HISTCMP_CORREL)
+                            if sim > best_sim:
+                                best_sim, best_pid = sim, pid
+
                     if best_pid is None: continue
                     used_pids_this_frame.add(best_pid)
+                    people[best_pid]["last_box"] = (x,y,w,h)  # keep tracking locked on for next frame
 
                     face_roi_bgr = frame[y:y+h, x:x+w]
                     try:
