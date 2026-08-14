@@ -2,6 +2,7 @@ import streamlit as st
 import cv2
 import numpy as np
 import pandas as pd
+import matplotlib
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 import mediapipe as mp
@@ -104,11 +105,28 @@ def load_model():
     return model, class_names, face_det
 
 
-def detect_faces(face_det, frame_bgr):
+def _iou(box_a, box_b):
+    """Intersection-over-Union of two (x,y,w,h) boxes — used to detect duplicate face boxes."""
+    ax, ay, aw, ah = box_a
+    bx, by, bw, bh = box_b
+    ix1, iy1 = max(ax, bx), max(ay, by)
+    ix2, iy2 = min(ax+aw, bx+bw), min(ay+ah, by+bh)
+    iw, ih = max(0, ix2-ix1), max(0, iy2-iy1)
+    intersection = iw * ih
+    union = aw*ah + bw*bh - intersection
+    return intersection / union if union > 0 else 0.0
+
+
+def detect_faces(face_det, frame_bgr, dedup_iou_thresh=0.4):
     """
     Runs MediaPipe face detection on a BGR frame and returns a list of
     (x, y, w, h) pixel boxes — same shape the rest of the app already
     expects, so the multi-person tracking logic below didn't need to change.
+
+    Also deduplicates near-identical overlapping boxes for the SAME real
+    face (a known MediaPipe quirk) — without this, duplicate boxes were
+    getting registered/tracked as two different people, causing both the
+    "one person shows as two" and "two people get identical stats" bugs.
     """
     h, w = frame_bgr.shape[:2]
     rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
@@ -123,7 +141,14 @@ def detect_faces(face_det, frame_bgr):
             bh = min(int(bbox.height * h), h - y)
             if bw > 0 and bh > 0:
                 boxes.append((x, y, bw, bh))
-    return boxes
+
+    # Deduplicate: if two boxes overlap heavily, keep only the larger one
+    boxes.sort(key=lambda b: b[2]*b[3], reverse=True)  # largest first
+    deduped = []
+    for box in boxes:
+        if all(_iou(box, kept) < dedup_iou_thresh for kept in deduped):
+            deduped.append(box)
+    return deduped
 
 
 INTEREST_MAP = {
@@ -236,7 +261,11 @@ def make_gradcam_heatmap(grad_model, img_array, pred_index):
 def overlay_heatmap(face_rgb_96, heatmap, alpha=0.45):
     heatmap_resized = cv2.resize(heatmap, (face_rgb_96.shape[1], face_rgb_96.shape[0]))
     heatmap_uint8 = np.uint8(255 * heatmap_resized)
-    colormap = cm.get_cmap("jet")
+    # matplotlib removed cm.get_cmap() in newer versions — matplotlib.colormaps[name] replaces it
+    try:
+        colormap = matplotlib.colormaps["jet"]
+    except AttributeError:
+        colormap = cm.get_cmap("jet")  # fallback for older matplotlib
     heatmap_colored = colormap(heatmap_uint8)[:, :, :3]
     heatmap_colored = np.uint8(heatmap_colored * 255)
     overlaid = np.uint8(face_rgb_96 * (1 - alpha) + heatmap_colored * alpha)
@@ -326,17 +355,21 @@ if uploaded is not None:
             if not ret: break
             gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             faces = detect_faces(face_det, frame)
+            used_pids_this_frame = set()  # prevents two faces in the same frame claiming the same person
             for (x,y,w,h) in faces:
                 gray_roi  = gray[y:y+h, x:x+w].copy()
                 face_size = w * h
                 matched_id, best_sim = None, threshold
                 for pid, pdata in people.items():
+                    if pid in used_pids_this_frame:
+                        continue
                     curr_h = cv2.calcHist([gray_roi],[0],None,[256],[0,256])
                     cv2.normalize(curr_h, curr_h)
                     sim = cv2.compareHist(pdata["hist"], curr_h, cv2.HISTCMP_CORREL)
                     if sim > best_sim:
                         best_sim, matched_id = sim, pid
                 if matched_id is not None:
+                    used_pids_this_frame.add(matched_id)
                     if face_size > people[matched_id]["size"]:
                         h_roi = cv2.calcHist([gray_roi],[0],None,[256],[0,256])
                         cv2.normalize(h_roi, h_roi)
@@ -349,6 +382,7 @@ if uploaded is not None:
                         cv2.normalize(h_roi, h_roi)
                         people[pid] = {"face": (x,y,w,h), "gray_roi": gray_roi,
                                         "frame": frame.copy(), "size": face_size, "hist": h_roi}
+                        used_pids_this_frame.add(pid)
         cap.release()
 
         st.markdown(f"### 👥 Found {len(people)} people")
@@ -374,16 +408,20 @@ if uploaded is not None:
 
             if fcount % 2 == 0:
                 faces = detect_faces(face_det, frame)
+                used_pids_this_frame = set()  # prevents two faces in the same frame claiming the same person
                 for (x,y,w,h) in faces:
                     gray_roi = gray[y:y+h, x:x+w]
                     curr_h   = cv2.calcHist([gray_roi],[0],None,[256],[0,256])
                     cv2.normalize(curr_h, curr_h)
                     best_pid, best_sim = None, 0.35
                     for pid, pdata in people.items():
+                        if pid in used_pids_this_frame:
+                            continue
                         sim = cv2.compareHist(pdata["hist"], curr_h, cv2.HISTCMP_CORREL)
                         if sim > best_sim:
                             best_sim, best_pid = sim, pid
                     if best_pid is None: continue
+                    used_pids_this_frame.add(best_pid)
 
                     face_roi_bgr = frame[y:y+h, x:x+w]
                     try:
