@@ -349,6 +349,7 @@ if uploaded is not None:
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         total  = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         people = {}
+        SPATIAL_STALE_FRAMES = 15  # if a person hasn't been seen in this many scan-frames, don't trust pure spatial proximity to re-identify them — require appearance confirmation instead
 
         for i in range(int(fps * scan_secs)):
             ret, frame = cap.read()
@@ -365,17 +366,22 @@ if uploaded is not None:
                 # between consecutive frames, so overlap with a person's last
                 # known position is a much more reliable match than appearance —
                 # brightness histograms drift too easily with pose/lighting change.
+                # Only trusted if that person was seen RECENTLY — otherwise a
+                # completely different new person standing in the same spot
+                # could wrongly inherit an old, stale identity.
                 best_iou = 0.25
                 for pid, pdata in people.items():
                     if pid in used_pids_this_frame:
+                        continue
+                    if i - pdata["last_seen"] > SPATIAL_STALE_FRAMES:
                         continue
                     iou = _iou((x,y,w,h), pdata["last_box"])
                     if iou > best_iou:
                         best_iou, matched_id = iou, pid
 
-                # 2) Fallback to appearance histogram — only used when there's no
-                # spatial match (e.g. this person's first sighting this scan, or
-                # they briefly left frame and are re-appearing).
+                # 2) Fallback to appearance histogram — used when there's no
+                # (trusted) spatial match: this person's first sighting this
+                # scan, or they left frame and are genuinely re-appearing.
                 if matched_id is None:
                     best_sim = threshold
                     for pid, pdata in people.items():
@@ -391,6 +397,7 @@ if uploaded is not None:
                     used_pids_this_frame.add(matched_id)
                     pdata = people[matched_id]
                     pdata["last_box"] = (x,y,w,h)  # always update position for next-frame continuity
+                    pdata["last_seen"] = i
                     if face_size > pdata["size"]:
                         h_roi = cv2.calcHist([gray_roi],[0],None,[256],[0,256])
                         cv2.normalize(h_roi, h_roi)
@@ -403,17 +410,9 @@ if uploaded is not None:
                         cv2.normalize(h_roi, h_roi)
                         people[pid] = {"face": (x,y,w,h), "gray_roi": gray_roi,
                                         "frame": frame.copy(), "size": face_size, "hist": h_roi,
-                                        "last_box": (x,y,w,h)}
+                                        "last_box": (x,y,w,h), "last_seen": i}
                         used_pids_this_frame.add(pid)
         cap.release()
-
-        st.markdown(f"### 👥 Found {len(people)} people")
-        if people:
-            cols = st.columns(len(people))
-            for pid, pdata in people.items():
-                x,y,w,h = pdata["face"]
-                fimg = cv2.cvtColor(pdata["frame"][y:y+h, x:x+w], cv2.COLOR_BGR2RGB)
-                cols[pid-1].image(fimg, caption=f"Person {pid}", use_container_width=True)
 
         # ── Analyze video ─────────────────────────────────
         status.text("🎬 Analyzing video frame by frame...")
@@ -421,6 +420,13 @@ if uploaded is not None:
         best_frame_per_person = {pid: {"conf": 0.0} for pid in people.keys()}
         emotion_counts = {pid: {} for pid in people.keys()}
         cap, fcount = cv2.VideoCapture(video_path), 0
+        SPATIAL_STALE_FRAMES = 45  # ~3s of gap at frame-skip=2 before spatial proximity alone is no longer trusted
+
+        # Any person found during the scan phase should be treated as "just seen"
+        # at the start of this loop, otherwise the staleness check below would
+        # immediately consider them stale before analysis even begins.
+        for pdata in people.values():
+            pdata["last_seen"] = 0
 
         while True:
             ret, frame = cap.read()
@@ -435,16 +441,20 @@ if uploaded is not None:
                     gray_roi = gray[y:y+h, x:x+w]
                     best_pid = None
 
-                    # 1) Spatial continuity first — same reasoning as the scan phase above
+                    # 1) Spatial continuity first — only trusted if that person
+                    # was seen recently, so a stale identity can't be hijacked
+                    # by a different new person standing in the same spot.
                     best_iou = 0.25
                     for pid, pdata in people.items():
                         if pid in used_pids_this_frame:
+                            continue
+                        if fcount - pdata["last_seen"] > SPATIAL_STALE_FRAMES:
                             continue
                         iou = _iou((x,y,w,h), pdata["last_box"])
                         if iou > best_iou:
                             best_iou, best_pid = iou, pid
 
-                    # 2) Fallback to appearance histogram if no spatial match
+                    # 2) Fallback to appearance histogram if no trusted spatial match
                     if best_pid is None:
                         curr_h = cv2.calcHist([gray_roi],[0],None,[256],[0,256])
                         cv2.normalize(curr_h, curr_h)
@@ -456,9 +466,29 @@ if uploaded is not None:
                             if sim > best_sim:
                                 best_sim, best_pid = sim, pid
 
-                    if best_pid is None: continue
+                    # 3) Still no match — register this as a BRAND NEW person if
+                    # there's room. Previously this simply skipped anyone who
+                    # first appeared after the initial scan window, meaning a
+                    # person showing up later in the video was never tracked.
+                    if best_pid is None:
+                        if len(people) < max_people:
+                            best_pid = len(people) + 1
+                            h_roi = cv2.calcHist([gray_roi],[0],None,[256],[0,256])
+                            cv2.normalize(h_roi, h_roi)
+                            people[best_pid] = {
+                                "face": (x,y,w,h), "gray_roi": gray_roi.copy(),
+                                "frame": frame.copy(), "size": w*h, "hist": h_roi,
+                                "last_box": (x,y,w,h), "last_seen": fcount,
+                            }
+                            timelines[best_pid] = []
+                            best_frame_per_person[best_pid] = {"conf": 0.0}
+                            emotion_counts[best_pid] = {}
+                        else:
+                            continue  # no room for a new person, skip this detection
+
                     used_pids_this_frame.add(best_pid)
                     people[best_pid]["last_box"] = (x,y,w,h)  # keep tracking locked on for next frame
+                    people[best_pid]["last_seen"] = fcount
 
                     face_roi_bgr = frame[y:y+h, x:x+w]
                     try:
@@ -490,6 +520,14 @@ if uploaded is not None:
         cap.release()
         status.text("✅ Analysis complete!")
         progress.progress(100)
+
+        st.markdown(f"### 👥 Found {len(people)} people")
+        if people:
+            cols = st.columns(len(people))
+            for pid, pdata in people.items():
+                x,y,w,h = pdata["face"]
+                fimg = cv2.cvtColor(pdata["frame"][y:y+h, x:x+w], cv2.COLOR_BGR2RGB)
+                cols[pid-1].image(fimg, caption=f"Person {pid}", use_container_width=True)
 
         # ── Show results ───────────────────────────────────
         st.markdown("---")
