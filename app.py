@@ -117,6 +117,24 @@ def _iou(box_a, box_b):
     return intersection / union if union > 0 else 0.0
 
 
+def is_scene_cut(prev_gray_small, curr_gray_small, threshold=0.5):
+    """
+    Detects a hard cut (edited video switching camera angle/speaker) using a
+    coarse whole-frame histogram comparison. During continuous footage
+    (someone talking, moving their head), the background and overall frame
+    stay similar frame-to-frame, so correlation stays high. A hard cut
+    changes the whole scene at once, causing a sharp drop — this is a much
+    stronger signal than trying to detect it from face position alone.
+    """
+    if prev_gray_small is None:
+        return False
+    h1 = cv2.calcHist([prev_gray_small], [0], None, [32], [0,256])
+    h2 = cv2.calcHist([curr_gray_small], [0], None, [32], [0,256])
+    cv2.normalize(h1, h1); cv2.normalize(h2, h2)
+    corr = cv2.compareHist(h1, h2, cv2.HISTCMP_CORREL)
+    return corr < threshold
+
+
 def detect_faces(face_det, frame_bgr, dedup_iou_thresh=0.4):
     """
     Runs MediaPipe face detection on a BGR frame and returns a list of
@@ -350,11 +368,16 @@ if uploaded is not None:
         total  = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         people = {}
         SPATIAL_STALE_FRAMES = 15  # if a person hasn't been seen in this many scan-frames, don't trust pure spatial proximity to re-identify them — require appearance confirmation instead
+        prev_gray_small = None
 
         for i in range(int(fps * scan_secs)):
             ret, frame = cap.read()
             if not ret: break
             gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            gray_small = cv2.resize(gray, (64, 64))
+            cut_detected = is_scene_cut(prev_gray_small, gray_small)
+            prev_gray_small = gray_small
+
             faces = detect_faces(face_det, frame)
             used_pids_this_frame = set()  # prevents two faces in the same frame claiming the same person
             for (x,y,w,h) in faces:
@@ -366,18 +389,20 @@ if uploaded is not None:
                 # between consecutive frames, so overlap with a person's last
                 # known position is a much more reliable match than appearance —
                 # brightness histograms drift too easily with pose/lighting change.
-                # Only trusted if that person was seen RECENTLY — otherwise a
-                # completely different new person standing in the same spot
-                # could wrongly inherit an old, stale identity.
+                # Only trusted if that person was seen RECENTLY, AND if this
+                # frame isn't right after a hard cut — an edited video switching
+                # camera angle/speaker can put a totally different person in the
+                # same screen position, which would otherwise fool this check.
                 best_iou = 0.25
-                for pid, pdata in people.items():
-                    if pid in used_pids_this_frame:
-                        continue
-                    if i - pdata["last_seen"] > SPATIAL_STALE_FRAMES:
-                        continue
-                    iou = _iou((x,y,w,h), pdata["last_box"])
-                    if iou > best_iou:
-                        best_iou, matched_id = iou, pid
+                if not cut_detected:
+                    for pid, pdata in people.items():
+                        if pid in used_pids_this_frame:
+                            continue
+                        if i - pdata["last_seen"] > SPATIAL_STALE_FRAMES:
+                            continue
+                        iou = _iou((x,y,w,h), pdata["last_box"])
+                        if iou > best_iou:
+                            best_iou, matched_id = iou, pid
 
                 # 2) Fallback to appearance histogram — used when there's no
                 # (trusted) spatial match: this person's first sighting this
@@ -428,11 +453,16 @@ if uploaded is not None:
         for pdata in people.values():
             pdata["last_seen"] = 0
 
+        prev_gray_small = None
+
         while True:
             ret, frame = cap.read()
             if not ret: break
             ts   = fcount / fps
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            gray_small = cv2.resize(gray, (64, 64))
+            cut_detected = is_scene_cut(prev_gray_small, gray_small)
+            prev_gray_small = gray_small
 
             if fcount % 2 == 0:
                 faces = detect_faces(face_det, frame)
@@ -442,17 +472,20 @@ if uploaded is not None:
                     best_pid = None
 
                     # 1) Spatial continuity first — only trusted if that person
-                    # was seen recently, so a stale identity can't be hijacked
-                    # by a different new person standing in the same spot.
+                    # was seen recently AND this isn't right after a hard cut
+                    # (edited video switching speaker/angle can put a different
+                    # person in the same screen position, which would otherwise
+                    # be wrongly read as "the same person, just moved").
                     best_iou = 0.25
-                    for pid, pdata in people.items():
-                        if pid in used_pids_this_frame:
-                            continue
-                        if fcount - pdata["last_seen"] > SPATIAL_STALE_FRAMES:
-                            continue
-                        iou = _iou((x,y,w,h), pdata["last_box"])
-                        if iou > best_iou:
-                            best_iou, best_pid = iou, pid
+                    if not cut_detected:
+                        for pid, pdata in people.items():
+                            if pid in used_pids_this_frame:
+                                continue
+                            if fcount - pdata["last_seen"] > SPATIAL_STALE_FRAMES:
+                                continue
+                            iou = _iou((x,y,w,h), pdata["last_box"])
+                            if iou > best_iou:
+                                best_iou, best_pid = iou, pid
 
                     # 2) Fallback to appearance histogram if no trusted spatial match
                     if best_pid is None:
