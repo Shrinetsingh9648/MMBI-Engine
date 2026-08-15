@@ -385,14 +385,19 @@ if uploaded is not None:
                 face_size = w * h
                 matched_id = None
 
-                # 1) SPATIAL CONTINUITY (primary signal): a face can't jump far
-                # between consecutive frames, so overlap with a person's last
-                # known position is a much more reliable match than appearance —
-                # brightness histograms drift too easily with pose/lighting change.
-                # Only trusted if that person was seen RECENTLY, AND if this
-                # frame isn't right after a hard cut — an edited video switching
-                # camera angle/speaker can put a totally different person in the
-                # same screen position, which would otherwise fool this check.
+                curr_h = cv2.calcHist([gray_roi],[0],None,[256],[0,256])
+                cv2.normalize(curr_h, curr_h)
+
+                # 1) SPATIAL CONTINUITY, but ALWAYS gated by a basic appearance
+                # sanity check — position alone isn't enough proof of identity.
+                # Two different people can easily occupy a similar screen spot
+                # (centered talking-head shots, or a hard cut our scene-cut
+                # detector didn't catch e.g. because both shots share a similar
+                # backdrop). Requiring the appearance not be wildly different
+                # (even at a loose bar) stops that specific failure mode, while
+                # still tolerating the pose/lighting drift within one person
+                # that made pure histogram matching unreliable in the first place.
+                APPEARANCE_SANITY_GATE = 0.15
                 best_iou = 0.25
                 if not cut_detected:
                     for pid, pdata in people.items():
@@ -402,7 +407,9 @@ if uploaded is not None:
                             continue
                         iou = _iou((x,y,w,h), pdata["last_box"])
                         if iou > best_iou:
-                            best_iou, matched_id = iou, pid
+                            sim = cv2.compareHist(pdata["hist"], curr_h, cv2.HISTCMP_CORREL)
+                            if sim > APPEARANCE_SANITY_GATE:
+                                best_iou, matched_id = iou, pid
 
                 # 2) Fallback to appearance histogram — used when there's no
                 # (trusted) spatial match: this person's first sighting this
@@ -412,8 +419,6 @@ if uploaded is not None:
                     for pid, pdata in people.items():
                         if pid in used_pids_this_frame:
                             continue
-                        curr_h = cv2.calcHist([gray_roi],[0],None,[256],[0,256])
-                        cv2.normalize(curr_h, curr_h)
                         sim = cv2.compareHist(pdata["hist"], curr_h, cv2.HISTCMP_CORREL)
                         if sim > best_sim:
                             best_sim, matched_id = sim, pid
@@ -471,11 +476,17 @@ if uploaded is not None:
                     gray_roi = gray[y:y+h, x:x+w]
                     best_pid = None
 
-                    # 1) Spatial continuity first — only trusted if that person
-                    # was seen recently AND this isn't right after a hard cut
-                    # (edited video switching speaker/angle can put a different
-                    # person in the same screen position, which would otherwise
-                    # be wrongly read as "the same person, just moved").
+                    curr_h = cv2.calcHist([gray_roi],[0],None,[256],[0,256])
+                    cv2.normalize(curr_h, curr_h)
+
+                    # 1) Spatial continuity, ALWAYS gated by a basic appearance
+                    # sanity check — position alone isn't proof of identity.
+                    # Two different people can occupy a similar screen spot
+                    # (centered shots, or a cut our scene-cut detector missed
+                    # because both shots share a similar backdrop). A loose
+                    # appearance gate stops that, while still tolerating the
+                    # pose/lighting drift within one person.
+                    APPEARANCE_SANITY_GATE = 0.15
                     best_iou = 0.25
                     if not cut_detected:
                         for pid, pdata in people.items():
@@ -485,12 +496,12 @@ if uploaded is not None:
                                 continue
                             iou = _iou((x,y,w,h), pdata["last_box"])
                             if iou > best_iou:
-                                best_iou, best_pid = iou, pid
+                                sim = cv2.compareHist(pdata["hist"], curr_h, cv2.HISTCMP_CORREL)
+                                if sim > APPEARANCE_SANITY_GATE:
+                                    best_iou, best_pid = iou, pid
 
                     # 2) Fallback to appearance histogram if no trusted spatial match
                     if best_pid is None:
-                        curr_h = cv2.calcHist([gray_roi],[0],None,[256],[0,256])
-                        cv2.normalize(curr_h, curr_h)
                         best_sim = 0.35
                         for pid, pdata in people.items():
                             if pid in used_pids_this_frame:
