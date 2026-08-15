@@ -11,9 +11,11 @@ from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
 import json
 import tempfile
 import os
+from io import BytesIO
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
+from reportlab.lib.utils import ImageReader
 import datetime
 
 # ============================================================
@@ -103,6 +105,38 @@ def load_model():
         model_selection=1, min_detection_confidence=0.5
     )
     return model, class_names, face_det
+
+
+def _fig_to_png_bytes(fig, dpi=150):
+    """Saves a matplotlib figure to PNG bytes in memory (for embedding in the PDF)."""
+    buf = BytesIO()
+    fig.savefig(buf, format="png", dpi=dpi, facecolor=fig.get_facecolor())
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def _draw_pdf_image(c, png_bytes, x, y_top, max_width, max_height):
+    """
+    Draws a PNG (from bytes) into a ReportLab canvas, scaled to fit within
+    max_width x max_height while preserving aspect ratio. Returns the actual
+    height drawn, so the caller can advance their y-cursor correctly.
+    """
+    img = ImageReader(BytesIO(png_bytes))
+    iw, ih = img.getSize()
+    scale = min(max_width / iw, max_height / ih)
+    draw_w, draw_h = iw * scale, ih * scale
+    c.drawImage(img, x, y_top - draw_h, width=draw_w, height=draw_h,
+                preserveAspectRatio=True, mask='auto')
+    return draw_h
+
+
+def _ensure_pdf_space(c, y, needed, page_w, page_h, margin=40):
+    """If the remaining space on the page is too small for the next block,
+    starts a new page and returns the reset y-cursor."""
+    if y - needed < margin:
+        c.showPage()
+        return page_h - 60
+    return y
 
 
 def _sharpness(gray_roi):
@@ -610,6 +644,7 @@ if uploaded is not None:
             person_dfs[pid] = df
 
         # ── Combined chart: everyone's timeline on one graph ──
+        combined_chart_png = None
         if len(person_dfs) > 0:
             st.markdown("### 🆚 All People — Combined Timeline")
             figc, axc = plt.subplots(figsize=(12,4.5))
@@ -630,6 +665,8 @@ if uploaded is not None:
             legend = axc.legend(facecolor="#1a1a2e", labelcolor="white")
             for sp in axc.spines.values(): sp.set_edgecolor("#555")
             st.pyplot(figc)
+            if generate_pdf:
+                combined_chart_png = _fig_to_png_bytes(figc)
             plt.close()
             st.markdown("---")
 
@@ -646,6 +683,14 @@ if uploaded is not None:
             pdf_data[pid] = dict(avg=avg, inter=inter, neut=neut, not_i=not_i,
                                   peak=max(scores), peak_t=tl[int(np.argmax(scores))]["time"])
 
+            if generate_pdf:
+                # Reference face image, for putting a face to the report
+                px, py, pw, ph = people[pid]["face"]
+                ref_crop_bgr = people[pid]["frame"][py:py+ph, px:px+pw]
+                ok, buf = cv2.imencode(".png", ref_crop_bgr)
+                if ok:
+                    pdf_data[pid]["ref_face_png"] = buf.tobytes()
+
             c1,c2,c3,c4 = st.columns(4)
             c1.metric("Avg Score", f"{avg:.1f}/100")
             c2.metric("Interested", f"{inter:.1f}%")
@@ -654,10 +699,13 @@ if uploaded is not None:
 
             if avg >= 65:
                 st.markdown('<div class="verdict-interested">✅ HIGHLY INTERESTED</div>', unsafe_allow_html=True)
+                pdf_data[pid]["verdict"] = "HIGHLY INTERESTED"
             elif avg >= 40:
                 st.markdown('<div class="verdict-neutral">➡️ NEUTRAL</div>', unsafe_allow_html=True)
+                pdf_data[pid]["verdict"] = "NEUTRAL"
             else:
                 st.markdown('<div class="verdict-not">❌ NOT INTERESTED</div>', unsafe_allow_html=True)
+                pdf_data[pid]["verdict"] = "NOT INTERESTED"
 
             # ── Timeline chart ──
             fig, ax = plt.subplots(figsize=(12,4))
@@ -677,6 +725,8 @@ if uploaded is not None:
             ax.tick_params(colors="white")
             for sp in ax.spines.values(): sp.set_edgecolor("#555")
             st.pyplot(fig)
+            if generate_pdf:
+                pdf_data[pid]["timeline_png"] = _fig_to_png_bytes(fig)
             plt.close()
 
             # ── Emotion distribution + Grad-CAM side by side ──
@@ -697,6 +747,8 @@ if uploaded is not None:
                     ax2.tick_params(colors="white", rotation=30)
                     for sp in ax2.spines.values(): sp.set_edgecolor("#555")
                     st.pyplot(fig2)
+                    if generate_pdf:
+                        pdf_data[pid]["emotion_png"] = _fig_to_png_bytes(fig2)
                     plt.close()
 
             with rc2:
@@ -710,6 +762,11 @@ if uploaded is not None:
                         overlaid = overlay_heatmap(bf["face_rgb_96"], heatmap)
                         cap_txt = f"Highest-confidence frame: '{bf['emotion']}' ({bf['conf']*100:.0f}%)"
                         st.image(overlaid, caption=cap_txt, use_container_width=True)
+                        if generate_pdf:
+                            ok, buf = cv2.imencode(".png", cv2.cvtColor(overlaid, cv2.COLOR_RGB2BGR))
+                            if ok:
+                                pdf_data[pid]["gradcam_png"] = buf.tobytes()
+                                pdf_data[pid]["gradcam_caption"] = cap_txt
                     except Exception as e:
                         st.info(f"Grad-CAM unavailable for this model architecture ({e})")
                 else:
@@ -751,25 +808,85 @@ if uploaded is not None:
         if generate_pdf:
             st.markdown("---")
             try:
+                import textwrap
+
+                def _draw_checkbox(c, x, y, size=9):
+                    c.rect(x, y, size, size, fill=0, stroke=1)
+
                 pdf_path = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf").name
                 c = canvas.Canvas(pdf_path, pagesize=A4)
                 W, H = A4
+                margin = 40
+                content_w = W - 2*margin
+
+                # ── Header ──
                 c.setFillColorRGB(0.05,0.05,0.3)
-                c.rect(0,H-80,W,80,fill=1,stroke=0)
+                c.rect(0,H-90,W,90,fill=1,stroke=0)
                 c.setFont("Helvetica-Bold",22)
                 c.setFillColor(colors.white)
-                c.drawString(40,H-45,"MMBI Engine Report")
+                c.drawString(margin,H-45,"MMBI Engine Report")
                 c.setFont("Helvetica",11)
-                c.drawString(40,H-65, f"Video: {uploaded.name}  |  Date: {datetime.datetime.now().strftime('%d %b %Y %H:%M')}")
-                y = H-110
+                c.drawString(margin,H-65, f"Video: {uploaded.name}  |  Date: {datetime.datetime.now().strftime('%d %b %Y %H:%M')}")
+                c.setFont("Helvetica-Oblique", 9)
+                c.drawString(margin, H-80, "AI-generated analysis -- please review and share feedback in each section below")
+
+                y = H - 110
+
+                # ── About / disclaimer, so this is understandable out of context ──
+                c.setFont("Helvetica", 9)
+                c.setFillColor(colors.grey)
+                about = ("This report was generated automatically using a MobileNetV2 facial-emotion model "
+                         "(75.8% test accuracy on the FER+ benchmark). It is an estimate of viewer interest "
+                         "based on facial expressions, not a certainty -- please use the feedback sections "
+                         "below to confirm whether it actually matches how the viewer felt.")
+                for line in textwrap.wrap(about, 100):
+                    y = _ensure_pdf_space(c, y, 14, W, H, margin)
+                    c.drawString(margin, y, line)
+                    y -= 12
+                y -= 10
+
+                # ── Combined chart (only meaningful with 2+ people) ──
+                if combined_chart_png is not None and len(pdf_data) > 1:
+                    y = _ensure_pdf_space(c, y, 200, W, H, margin)
+                    c.setFont("Helvetica-Bold", 13)
+                    c.setFillColor(colors.black)
+                    c.drawString(margin, y, "All People -- Combined Timeline")
+                    y -= 18
+                    drawn_h = _draw_pdf_image(c, combined_chart_png, margin, y, content_w, 220)
+                    y -= drawn_h + 20
+
+                # ── Per-person sections ──
+                verdict_color_map = {
+                    "HIGHLY INTERESTED": colors.HexColor("#0a8a0a"),
+                    "NEUTRAL": colors.HexColor("#b8860b"),
+                    "NOT INTERESTED": colors.HexColor("#c0392b"),
+                }
+
                 for pid, d in pdf_data.items():
+                    y = _ensure_pdf_space(c, y, 40, W, H, margin)
                     c.setFillColorRGB(0.1,0.1,0.5)
-                    c.rect(30,y-5,W-60,30,fill=1,stroke=0)
-                    c.setFont("Helvetica-Bold",14)
+                    c.rect(margin, y-25, content_w, 30, fill=1, stroke=0)
+                    c.setFont("Helvetica-Bold", 14)
                     c.setFillColor(colors.white)
-                    c.drawString(40,y+8,f"Person {pid}")
+                    c.drawString(margin+10, y-17, f"Person {pid}")
                     y -= 45
-                    c.setFont("Helvetica",11)
+
+                    # Reference face + stats side-by-side
+                    face_w = 100
+                    y = _ensure_pdf_space(c, y, face_w + 10, W, H, margin)
+                    row_top = y
+                    if d.get("ref_face_png"):
+                        _draw_pdf_image(c, d["ref_face_png"], margin, row_top, face_w, face_w)
+                        stats_x = margin + face_w + 20
+                    else:
+                        stats_x = margin
+
+                    stat_y = row_top - 14
+                    c.setFont("Helvetica-Bold", 13)
+                    c.setFillColor(verdict_color_map.get(d.get("verdict"), colors.black))
+                    c.drawString(stats_x, stat_y, d.get("verdict", ""))
+                    stat_y -= 20
+                    c.setFont("Helvetica", 10)
                     c.setFillColor(colors.black)
                     for label, val in [
                         ("Average Score", f"{d['avg']:.1f}/100"),
@@ -778,9 +895,66 @@ if uploaded is not None:
                         ("Not Interested", f"{d['not_i']:.1f}%"),
                         ("Peak Interest", f"{d['peak']:.0f}% at {d['peak_t']:.1f}s"),
                     ]:
-                        c.drawString(50,y,f"{label}: {val}")
-                        y -= 20
-                    y -= 20
+                        c.drawString(stats_x, stat_y, f"{label}: {val}")
+                        stat_y -= 15
+
+                    y = row_top - face_w - 15
+
+                    # Timeline chart
+                    if d.get("timeline_png"):
+                        y = _ensure_pdf_space(c, y, 180, W, H, margin)
+                        c.setFont("Helvetica-Bold", 11)
+                        c.setFillColor(colors.black)
+                        c.drawString(margin, y, "Interest Timeline")
+                        y -= 14
+                        drawn_h = _draw_pdf_image(c, d["timeline_png"], margin, y, content_w, 170)
+                        y -= drawn_h + 15
+
+                    # Emotion distribution + Grad-CAM side by side
+                    half_w = (content_w - 15) / 2
+                    has_emo = bool(d.get("emotion_png"))
+                    has_grad = bool(d.get("gradcam_png"))
+                    if has_emo or has_grad:
+                        y = _ensure_pdf_space(c, y, 170, W, H, margin)
+                        row_top2 = y
+                        c.setFont("Helvetica-Bold", 10)
+                        c.setFillColor(colors.black)
+                        drawn_h1 = drawn_h2 = 0
+                        if has_emo:
+                            c.drawString(margin, row_top2, "Emotion Distribution")
+                            drawn_h1 = _draw_pdf_image(c, d["emotion_png"], margin, row_top2 - 12, half_w, 140)
+                        if has_grad:
+                            gx = margin + half_w + 15
+                            c.drawString(gx, row_top2, "Grad-CAM Focus")
+                            drawn_h2 = _draw_pdf_image(c, d["gradcam_png"], gx, row_top2 - 12, half_w, 140)
+                        y = row_top2 - 12 - max(drawn_h1, drawn_h2) - 15
+
+                    # Viewer feedback section -- the whole point of sending this to the person
+                    fb_h = 100
+                    y = _ensure_pdf_space(c, y, fb_h + 10, W, H, margin)
+                    c.setStrokeColor(colors.HexColor("#888888"))
+                    c.setLineWidth(1)
+                    c.rect(margin, y-fb_h, content_w, fb_h, fill=0, stroke=1)
+                    c.setFont("Helvetica-Bold", 11)
+                    c.setFillColor(colors.black)
+                    c.drawString(margin+10, y-16, "Viewer Feedback -- does this match how you actually felt?")
+                    c.setFont("Helvetica", 10)
+                    cb_y = y - 38
+                    _draw_checkbox(c, margin+10, cb_y-7, 9)
+                    c.drawString(margin+24, cb_y-9, "Yes, accurate")
+                    _draw_checkbox(c, margin+150, cb_y-7, 9)
+                    c.drawString(margin+164, cb_y-9, "Partially accurate")
+                    _draw_checkbox(c, margin+330, cb_y-7, 9)
+                    c.drawString(margin+344, cb_y-9, "Not accurate")
+                    c.drawString(margin+10, y-60, "Comments:")
+                    c.line(margin+80, y-61, margin+content_w-10, y-61)
+                    c.line(margin+10, y-80, margin+content_w-10, y-80)
+                    y -= fb_h + 25
+
+                # Footer
+                c.setFont("Helvetica", 8)
+                c.setFillColor(colors.grey)
+                c.drawString(margin, 25, "Generated by MMBI Engine -- AI-Powered Audience Engagement Analytics")
                 c.save()
 
                 with open(pdf_path, "rb") as f:
