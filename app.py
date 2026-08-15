@@ -105,6 +105,18 @@ def load_model():
     return model, class_names, face_det
 
 
+def _sharpness(gray_roi):
+    """
+    Measures image sharpness via Laplacian variance — a standard, cheap blur
+    detector (blurry images have far less high-frequency edge detail, so the
+    variance of the Laplacian drops sharply). Used to avoid picking a
+    motion-blurred frame as someone's representative reference photo.
+    """
+    if gray_roi is None or gray_roi.size == 0:
+        return 0.0
+    return cv2.Laplacian(gray_roi, cv2.CV_64F).var()
+
+
 def _iou(box_a, box_b):
     """Intersection-over-Union of two (x,y,w,h) boxes — used to detect duplicate face boxes."""
     ax, ay, aw, ah = box_a
@@ -428,11 +440,15 @@ if uploaded is not None:
                     pdata = people[matched_id]
                     pdata["last_box"] = (x,y,w,h)  # always update position for next-frame continuity
                     pdata["last_seen"] = i
-                    if face_size > pdata["size"]:
+                    # Quality = size * sharpness — prefers a bigger AND clearer
+                    # face crop, so a blurrier-but-bigger frame (e.g. camera
+                    # shake) doesn't overwrite a smaller-but-sharper one.
+                    new_quality = face_size * (1 + _sharpness(gray_roi))
+                    if new_quality > pdata.get("quality", 0):
                         h_roi = cv2.calcHist([gray_roi],[0],None,[256],[0,256])
                         cv2.normalize(h_roi, h_roi)
                         pdata.update(face=(x,y,w,h), gray_roi=gray_roi, frame=frame.copy(),
-                                     size=face_size, hist=h_roi)
+                                     size=face_size, hist=h_roi, quality=new_quality)
                 else:
                     if len(people) < max_people:
                         pid = len(people) + 1
@@ -440,7 +456,8 @@ if uploaded is not None:
                         cv2.normalize(h_roi, h_roi)
                         people[pid] = {"face": (x,y,w,h), "gray_roi": gray_roi,
                                         "frame": frame.copy(), "size": face_size, "hist": h_roi,
-                                        "last_box": (x,y,w,h), "last_seen": i}
+                                        "last_box": (x,y,w,h), "last_seen": i,
+                                        "quality": face_size * (1 + _sharpness(gray_roi))}
                         used_pids_this_frame.add(pid)
         cap.release()
 
@@ -550,11 +567,18 @@ if uploaded is not None:
                     timelines[best_pid].append({"time": round(ts,2), "score": score, "emotion": emotion})
                     emotion_counts[best_pid][emotion] = emotion_counts[best_pid].get(emotion, 0) + 1
 
-                    if conf > best_frame_per_person[best_pid]["conf"]:
+                    # Blend confidence with sharpness so a confident-but-blurry
+                    # frame (motion blur can still classify fine) doesn't win
+                    # over a clearer one — sharpness is capped so it nudges the
+                    # choice rather than overriding confidence entirely.
+                    sharpness_val = _sharpness(cv2.cvtColor(face_roi_bgr, cv2.COLOR_BGR2GRAY))
+                    new_quality = conf * (1 + min(sharpness_val, 500) / 500)
+                    if new_quality > best_frame_per_person[best_pid].get("quality", 0):
                         best_frame_per_person[best_pid] = {
                             "conf": conf, "emotion": emotion,
                             "face_rgb_96": face_rgb_96,
                             "pred_index": class_names.index(emotion) if emotion in class_names else 0,
+                            "quality": new_quality,
                         }
 
             pct = int(fcount/total*100)
