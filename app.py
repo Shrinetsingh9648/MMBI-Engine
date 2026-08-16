@@ -139,6 +139,163 @@ def _ensure_pdf_space(c, y, needed, page_w, page_h, margin=40):
     return y
 
 
+def _color_hist(frame_bgr, box):
+    """
+    Appearance descriptor for person re-identification. Uses Hue+Saturation
+    from HSV (not raw BGR or grayscale) because H/S are far more stable
+    under lighting changes than brightness — a person's hair/skin/clothing
+    hue stays roughly the same whether they're brightly or dimly lit, unlike
+    a plain grayscale intensity histogram, which was the old approach and
+    is easily confused between people who happen to have similar brightness.
+    """
+    x, y, w, h = box
+    roi = frame_bgr[y:y+h, x:x+w]
+    if roi.size == 0:
+        return None
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    hist = cv2.calcHist([hsv], [0, 1], None, [30, 32], [0, 180, 0, 256])
+    cv2.normalize(hist, hist, 0, 1, cv2.NORM_MINMAX)
+    return hist
+
+
+def _match_frame_faces(faces, frame_bgr, people, frame_idx, cut_detected,
+                        stale_frames, appearance_gate, fallback_threshold,
+                        max_people, recycle_after_frames, iou_min=0.25,
+                        absolute_max_people=None):
+    """
+    Decides which known person (if any) each detected face belongs to, for
+    ONE frame — shared by both the initial scan and the main analysis loop
+    so their matching behavior can't silently drift apart.
+
+    Uses a GLOBALLY SORTED GREEDY assignment: every plausible (face, person)
+    pairing in the frame is scored, then assignments are made strongest-
+    match-first. This matters when two people are near each other — matching
+    each face independently in whatever order they were detected can let an
+    earlier face "steal" a person that was actually the better match for a
+    different face, silently swapping two people's identities. Sorting by
+    score first prevents that.
+
+    SLOT RECYCLING: `max_people` limits how many people can be tracked
+    SIMULTANEOUSLY, not the total across the whole video. If all slots are
+    full and a new, unmatched face shows up, the ACTIVE person who's been
+    absent the LONGEST is retired (stops being a match target) to free a
+    slot — but only if their absence clearly exceeds a normal occlusion gap
+    (`recycle_after_frames`, deliberately much longer than `stale_frames`),
+    so a person who just looked away or was briefly covered keeps their
+    reserved slot rather than losing it to someone else. A retired person
+    keeps their own separate id and their timeline so far is untouched —
+    they are NEVER merged with whoever takes their old slot. This is a
+    one-way trip: if they return later, they'll be treated as a new person
+    (getting a fresh id) rather than silently reactivated, since reactivating
+    them risks exceeding capacity again and adds the kind of ambiguity that
+    caused identity-merging bugs before.
+
+    Mutates `people` in place. Returns a list of (box, pid, is_new_person)
+    for every face that got assigned; faces with nowhere to go (no match,
+    no free slot even after checking for a recyclable one) are omitted.
+    """
+    if absolute_max_people is None:
+        absolute_max_people = max(8, max_people * 4)  # hard safety cap against runaway id creation from noisy detections
+
+    def _active_people():
+        return {pid: p for pid, p in people.items() if p.get("active", True)}
+
+    face_hists = []
+    for box in faces:
+        face_hists.append(_color_hist(frame_bgr, box))
+
+    active = _active_people()
+    candidates = []  # (score, face_idx, pid) -- higher score = better match
+    for face_idx, box in enumerate(faces):
+        hist = face_hists[face_idx]
+        if hist is None:
+            continue
+
+        # Spatial candidates: gated by appearance so position alone is never
+        # sufficient (this is what stopped different people merging when
+        # they land in a similar screen spot). Given a +1.0 offset so any
+        # valid spatial match always outranks a pure-appearance one, since
+        # position is the stronger signal when both agree on WHO.
+        if not cut_detected:
+            for pid, pdata in active.items():
+                if frame_idx - pdata["last_seen"] > stale_frames:
+                    continue
+                iou = _iou(box, pdata["last_box"])
+                if iou > iou_min:
+                    sim = cv2.compareHist(pdata["hist"], hist, cv2.HISTCMP_CORREL)
+                    if sim > appearance_gate:
+                        candidates.append((1.0 + iou + sim, face_idx, pid))
+
+        # Appearance-only candidates: the fallback for first sightings,
+        # re-appearances after a gap, or right after a detected cut.
+        for pid, pdata in active.items():
+            sim = cv2.compareHist(pdata["hist"], hist, cv2.HISTCMP_CORREL)
+            if sim > fallback_threshold:
+                candidates.append((sim, face_idx, pid))
+
+    candidates.sort(key=lambda c: c[0], reverse=True)
+
+    face_to_pid = {}
+    used_pids = set()
+    for score, face_idx, pid in candidates:
+        if face_idx in face_to_pid or pid in used_pids:
+            continue
+        face_to_pid[face_idx] = pid
+        used_pids.add(pid)
+
+    results = []
+    for face_idx, box in enumerate(faces):
+        hist = face_hists[face_idx]
+        if hist is None:
+            continue
+        x, y, w, h = box
+        face_size = w * h
+        is_new = False
+
+        if face_idx in face_to_pid:
+            pid = face_to_pid[face_idx]
+        else:
+            active = _active_people()  # recompute — may have changed via recycling below in this same frame
+            if len(active) < max_people:
+                if len(people) >= absolute_max_people:
+                    continue  # safety cap hit — treat as noise rather than tracking indefinitely
+                pid = len(people) + 1
+                people[pid] = {"face": box, "frame": frame_bgr.copy(), "size": 0, "active": True,
+                                "hist": hist, "last_box": box, "last_seen": frame_idx, "quality": 0}
+                is_new = True
+            else:
+                # All slots full — check whether the longest-absent active
+                # person has genuinely left (not just occluded) and can be
+                # safely retired to make room, without touching their data.
+                oldest_pid, oldest_gap = None, -1
+                for cand_pid, cand_pdata in active.items():
+                    gap = frame_idx - cand_pdata["last_seen"]
+                    if gap > oldest_gap:
+                        oldest_gap, oldest_pid = gap, cand_pid
+                if oldest_pid is not None and oldest_gap > recycle_after_frames:
+                    people[oldest_pid]["active"] = False
+                    if len(people) >= absolute_max_people:
+                        continue
+                    pid = len(people) + 1
+                    people[pid] = {"face": box, "frame": frame_bgr.copy(), "size": 0, "active": True,
+                                    "hist": hist, "last_box": box, "last_seen": frame_idx, "quality": 0}
+                    is_new = True
+                else:
+                    continue  # everyone plausibly still around, no room for a new person this frame
+
+        pdata = people[pid]
+        pdata["last_box"] = box
+        pdata["last_seen"] = frame_idx
+        gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY) if (roi := frame_bgr[y:y+h, x:x+w]).size > 0 else None
+        quality = face_size * (1 + _sharpness(gray_roi))
+        if quality > pdata.get("quality", 0):
+            pdata.update(face=box, frame=frame_bgr.copy(), size=face_size, hist=hist, quality=quality)
+
+        results.append((box, pid, is_new))
+
+    return results
+
+
 def _sharpness(gray_roi):
     """
     Measures image sharpness via Laplacian variance — a standard, cheap blur
@@ -413,7 +570,9 @@ if uploaded is not None:
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         total  = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         people = {}
-        SPATIAL_STALE_FRAMES = 15  # if a person hasn't been seen in this many scan-frames, don't trust pure spatial proximity to re-identify them — require appearance confirmation instead
+        SPATIAL_STALE_FRAMES_SCAN = int(fps * 0.5)   # ~0.5s -- fps-aware so a 60fps video isn't 4x twitchier than a 15fps one
+        RECYCLE_AFTER_FRAMES_SCAN = int(fps * 3)     # ~3s -- only free a slot for someone new after a much longer absence than the staleness window above, so a brief look-away during the scan doesn't cost someone their slot
+        APPEARANCE_SANITY_GATE = 0.15
         prev_gray_small = None
 
         for i in range(int(fps * scan_secs)):
@@ -425,74 +584,9 @@ if uploaded is not None:
             prev_gray_small = gray_small
 
             faces = detect_faces(face_det, frame)
-            used_pids_this_frame = set()  # prevents two faces in the same frame claiming the same person
-            for (x,y,w,h) in faces:
-                gray_roi  = gray[y:y+h, x:x+w].copy()
-                face_size = w * h
-                matched_id = None
-
-                curr_h = cv2.calcHist([gray_roi],[0],None,[256],[0,256])
-                cv2.normalize(curr_h, curr_h)
-
-                # 1) SPATIAL CONTINUITY, but ALWAYS gated by a basic appearance
-                # sanity check — position alone isn't enough proof of identity.
-                # Two different people can easily occupy a similar screen spot
-                # (centered talking-head shots, or a hard cut our scene-cut
-                # detector didn't catch e.g. because both shots share a similar
-                # backdrop). Requiring the appearance not be wildly different
-                # (even at a loose bar) stops that specific failure mode, while
-                # still tolerating the pose/lighting drift within one person
-                # that made pure histogram matching unreliable in the first place.
-                APPEARANCE_SANITY_GATE = 0.15
-                best_iou = 0.25
-                if not cut_detected:
-                    for pid, pdata in people.items():
-                        if pid in used_pids_this_frame:
-                            continue
-                        if i - pdata["last_seen"] > SPATIAL_STALE_FRAMES:
-                            continue
-                        iou = _iou((x,y,w,h), pdata["last_box"])
-                        if iou > best_iou:
-                            sim = cv2.compareHist(pdata["hist"], curr_h, cv2.HISTCMP_CORREL)
-                            if sim > APPEARANCE_SANITY_GATE:
-                                best_iou, matched_id = iou, pid
-
-                # 2) Fallback to appearance histogram — used when there's no
-                # (trusted) spatial match: this person's first sighting this
-                # scan, or they left frame and are genuinely re-appearing.
-                if matched_id is None:
-                    best_sim = threshold
-                    for pid, pdata in people.items():
-                        if pid in used_pids_this_frame:
-                            continue
-                        sim = cv2.compareHist(pdata["hist"], curr_h, cv2.HISTCMP_CORREL)
-                        if sim > best_sim:
-                            best_sim, matched_id = sim, pid
-
-                if matched_id is not None:
-                    used_pids_this_frame.add(matched_id)
-                    pdata = people[matched_id]
-                    pdata["last_box"] = (x,y,w,h)  # always update position for next-frame continuity
-                    pdata["last_seen"] = i
-                    # Quality = size * sharpness — prefers a bigger AND clearer
-                    # face crop, so a blurrier-but-bigger frame (e.g. camera
-                    # shake) doesn't overwrite a smaller-but-sharper one.
-                    new_quality = face_size * (1 + _sharpness(gray_roi))
-                    if new_quality > pdata.get("quality", 0):
-                        h_roi = cv2.calcHist([gray_roi],[0],None,[256],[0,256])
-                        cv2.normalize(h_roi, h_roi)
-                        pdata.update(face=(x,y,w,h), gray_roi=gray_roi, frame=frame.copy(),
-                                     size=face_size, hist=h_roi, quality=new_quality)
-                else:
-                    if len(people) < max_people:
-                        pid = len(people) + 1
-                        h_roi = cv2.calcHist([gray_roi],[0],None,[256],[0,256])
-                        cv2.normalize(h_roi, h_roi)
-                        people[pid] = {"face": (x,y,w,h), "gray_roi": gray_roi,
-                                        "frame": frame.copy(), "size": face_size, "hist": h_roi,
-                                        "last_box": (x,y,w,h), "last_seen": i,
-                                        "quality": face_size * (1 + _sharpness(gray_roi))}
-                        used_pids_this_frame.add(pid)
+            _match_frame_faces(faces, frame, people, i, cut_detected,
+                                SPATIAL_STALE_FRAMES_SCAN, APPEARANCE_SANITY_GATE, threshold,
+                                max_people, RECYCLE_AFTER_FRAMES_SCAN)
         cap.release()
 
         # ── Analyze video ─────────────────────────────────
@@ -501,7 +595,8 @@ if uploaded is not None:
         best_frame_per_person = {pid: {"conf": 0.0} for pid in people.keys()}
         emotion_counts = {pid: {} for pid in people.keys()}
         cap, fcount = cv2.VideoCapture(video_path), 0
-        SPATIAL_STALE_FRAMES = 45  # ~3s of gap at frame-skip=2 before spatial proximity alone is no longer trusted
+        SPATIAL_STALE_FRAMES_MAIN = 45  # ~3s of gap at frame-skip=2 before spatial proximity alone is no longer trusted
+        RECYCLE_AFTER_FRAMES_MAIN = int(fps * 10)  # ~10s of absence -- long enough that this is "they left", not "they looked away"
 
         # Any person found during the scan phase should be treated as "just seen"
         # at the start of this loop, otherwise the staleness check below would
@@ -522,68 +617,14 @@ if uploaded is not None:
 
             if fcount % 2 == 0:
                 faces = detect_faces(face_det, frame)
-                used_pids_this_frame = set()  # prevents two faces in the same frame claiming the same person
-                for (x,y,w,h) in faces:
-                    gray_roi = gray[y:y+h, x:x+w]
-                    best_pid = None
-
-                    curr_h = cv2.calcHist([gray_roi],[0],None,[256],[0,256])
-                    cv2.normalize(curr_h, curr_h)
-
-                    # 1) Spatial continuity, ALWAYS gated by a basic appearance
-                    # sanity check — position alone isn't proof of identity.
-                    # Two different people can occupy a similar screen spot
-                    # (centered shots, or a cut our scene-cut detector missed
-                    # because both shots share a similar backdrop). A loose
-                    # appearance gate stops that, while still tolerating the
-                    # pose/lighting drift within one person.
-                    APPEARANCE_SANITY_GATE = 0.15
-                    best_iou = 0.25
-                    if not cut_detected:
-                        for pid, pdata in people.items():
-                            if pid in used_pids_this_frame:
-                                continue
-                            if fcount - pdata["last_seen"] > SPATIAL_STALE_FRAMES:
-                                continue
-                            iou = _iou((x,y,w,h), pdata["last_box"])
-                            if iou > best_iou:
-                                sim = cv2.compareHist(pdata["hist"], curr_h, cv2.HISTCMP_CORREL)
-                                if sim > APPEARANCE_SANITY_GATE:
-                                    best_iou, best_pid = iou, pid
-
-                    # 2) Fallback to appearance histogram if no trusted spatial match
-                    if best_pid is None:
-                        best_sim = 0.35
-                        for pid, pdata in people.items():
-                            if pid in used_pids_this_frame:
-                                continue
-                            sim = cv2.compareHist(pdata["hist"], curr_h, cv2.HISTCMP_CORREL)
-                            if sim > best_sim:
-                                best_sim, best_pid = sim, pid
-
-                    # 3) Still no match — register this as a BRAND NEW person if
-                    # there's room. Previously this simply skipped anyone who
-                    # first appeared after the initial scan window, meaning a
-                    # person showing up later in the video was never tracked.
-                    if best_pid is None:
-                        if len(people) < max_people:
-                            best_pid = len(people) + 1
-                            h_roi = cv2.calcHist([gray_roi],[0],None,[256],[0,256])
-                            cv2.normalize(h_roi, h_roi)
-                            people[best_pid] = {
-                                "face": (x,y,w,h), "gray_roi": gray_roi.copy(),
-                                "frame": frame.copy(), "size": w*h, "hist": h_roi,
-                                "last_box": (x,y,w,h), "last_seen": fcount,
-                            }
-                            timelines[best_pid] = []
-                            best_frame_per_person[best_pid] = {"conf": 0.0}
-                            emotion_counts[best_pid] = {}
-                        else:
-                            continue  # no room for a new person, skip this detection
-
-                    used_pids_this_frame.add(best_pid)
-                    people[best_pid]["last_box"] = (x,y,w,h)  # keep tracking locked on for next frame
-                    people[best_pid]["last_seen"] = fcount
+                matches = _match_frame_faces(faces, frame, people, fcount, cut_detected,
+                                              SPATIAL_STALE_FRAMES_MAIN, APPEARANCE_SANITY_GATE, threshold,
+                                              max_people, RECYCLE_AFTER_FRAMES_MAIN)
+                for (x,y,w,h), best_pid, is_new in matches:
+                    if is_new:
+                        timelines[best_pid] = []
+                        best_frame_per_person[best_pid] = {"conf": 0.0}
+                        emotion_counts[best_pid] = {}
 
                     face_roi_bgr = frame[y:y+h, x:x+w]
                     try:
