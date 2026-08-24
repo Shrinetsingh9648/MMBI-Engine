@@ -209,7 +209,14 @@ def _match_frame_faces(faces, frame_bgr, people, frame_idx, cut_detected,
     no free slot even after checking for a recyclable one) are omitted.
     """
     if absolute_max_people is None:
-        absolute_max_people = max(8, max_people * 4)  # hard safety cap against runaway id creation from noisy detections
+        # This must equal max_people, not a multiple of it. It caps the TOTAL
+        # number of distinct person identities ever created for the whole
+        # video, not just how many can be active at once. Previously this was
+        # max(8, max_people * 4), which let the tracker silently mint new
+        # identities (via slot recycling after someone leaves/reappears) far
+        # beyond what the "Max people to track" sidebar setting promised --
+        # e.g. a slider set to 1 could still end up reporting 3+ people.
+        absolute_max_people = max_people
 
     def _active_people():
         return {pid: p for pid, p in people.items() if p.get("active", True)}
