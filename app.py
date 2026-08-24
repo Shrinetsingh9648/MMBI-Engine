@@ -247,10 +247,27 @@ def _match_frame_faces(faces, frame_bgr, people, frame_idx, cut_detected,
         # ranges overlap, so appearance alone cannot cleanly separate them.
         # IoU does separate them in tested footage (0.965 for genuine
         # continuity vs 0.615 for a real cut), so very high spatial overlap
-        # is trusted with almost no appearance confirmation needed, while
-        # moderate overlap still requires the full appearance bar.
+        # is trusted with almost no appearance confirmation needed.
+        #
+        # A THIRD, MODERATE tier was added after real footage showed the
+        # original two-tier version losing tracking of a person who never
+        # left frame or got cut away from: as someone turns their head or
+        # lighting shifts slightly, IoU against their last box commonly
+        # drops into the 0.4-0.85 range (still clearly continuous motion,
+        # no cut) while appearance correlation dips as low as ~0.72 at the
+        # same time -- both well under the 0.85 appearance_gate used for
+        # HIGH_IOU misses, which caused the match to be rejected, the
+        # person to go stale, and (since re-acquisition also requires
+        # appearance_gate) tracking to permanently stop for the rest of
+        # the video. Requiring the FULL appearance bar at moderate-but-real
+        # spatial overlap was too strict for actual footage; a lower gate
+        # here still protects against the two-people-swap case (which
+        # shows much lower IoU, well under MODERATE_IOU_THRESHOLD) while
+        # letting ordinary head movement keep matching.
         HIGH_IOU_THRESHOLD = 0.85
         HIGH_IOU_GATE = 0.0  # near pass-through -- position alone is the signal at this level of overlap
+        MODERATE_IOU_THRESHOLD = 0.4
+        MODERATE_IOU_GATE = 0.55
         if not cut_detected:
             for pid, pdata in active.items():
                 if frame_idx - pdata["last_seen"] > stale_frames:
@@ -258,7 +275,12 @@ def _match_frame_faces(faces, frame_bgr, people, frame_idx, cut_detected,
                 iou = _iou(box, pdata["last_box"])
                 if iou > iou_min:
                     sim = cv2.compareHist(pdata["hist"], hist, cv2.HISTCMP_CORREL)
-                    required_gate = HIGH_IOU_GATE if iou > HIGH_IOU_THRESHOLD else appearance_gate
+                    if iou > HIGH_IOU_THRESHOLD:
+                        required_gate = HIGH_IOU_GATE
+                    elif iou > MODERATE_IOU_THRESHOLD:
+                        required_gate = MODERATE_IOU_GATE
+                    else:
+                        required_gate = appearance_gate
                     if sim > required_gate:
                         candidates.append((1.0 + iou + sim, face_idx, pid))
 
@@ -292,9 +314,7 @@ def _match_frame_faces(faces, frame_bgr, people, frame_idx, cut_detected,
             pid = face_to_pid[face_idx]
         else:
             active = _active_people()  # recompute — may have changed via recycling below in this same frame
-            if len(active) < max_people:
-                if len(people) >= absolute_max_people:
-                    continue  # safety cap hit — treat as noise rather than tracking indefinitely
+            if len(active) < max_people and len(people) < absolute_max_people:
                 pid = len(people) + 1
                 people[pid] = {"face": box, "frame": frame_bgr.copy(), "size": 0, "active": True,
                                 "hist": hist, "last_box": box, "last_seen": frame_idx, "quality": 0}
@@ -309,12 +329,20 @@ def _match_frame_faces(faces, frame_bgr, people, frame_idx, cut_detected,
                     if gap > oldest_gap:
                         oldest_gap, oldest_pid = gap, cand_pid
                 if oldest_pid is not None and oldest_gap > recycle_after_frames:
-                    people[oldest_pid]["active"] = False
-                    if len(people) >= absolute_max_people:
-                        continue
-                    pid = len(people) + 1
-                    people[pid] = {"face": box, "frame": frame_bgr.copy(), "size": 0, "active": True,
-                                    "hist": hist, "last_box": box, "last_seen": frame_idx, "quality": 0}
+                    # Reuse the retired person's own id/slot rather than
+                    # minting a new one. This keeps the total number of
+                    # distinct "Person N" identities capped at exactly
+                    # max_people (matching the "Max people to track"
+                    # setting), and — critically — means tracking can
+                    # always resume after a genuine long absence instead
+                    # of permanently stopping once max_people identities
+                    # have ever been created. Their prior timeline/photo
+                    # data (kept elsewhere, keyed by this same pid) is
+                    # intentionally left as-is; the caller treats is_new
+                    # as the signal to start a fresh timeline for the pid.
+                    people[oldest_pid] = {"face": box, "frame": frame_bgr.copy(), "size": 0, "active": True,
+                                            "hist": hist, "last_box": box, "last_seen": frame_idx, "quality": 0}
+                    pid = oldest_pid
                     is_new = True
                 else:
                     continue  # everyone plausibly still around, no room for a new person this frame
@@ -322,10 +350,25 @@ def _match_frame_faces(faces, frame_bgr, people, frame_idx, cut_detected,
         pdata = people[pid]
         pdata["last_box"] = box
         pdata["last_seen"] = frame_idx
+        # The matching reference ("hist") is refreshed on EVERY match, not
+        # just quality improvements. It previously only updated inside the
+        # quality-gated block below, which ties it to "best representative
+        # photo" bookkeeping -- meant for picking a clear snapshot to show
+        # in the report, not for tracking continuity. That let it freeze on
+        # whatever frame had the best size/sharpness early on and never
+        # update again. As the person's appearance naturally drifted from
+        # that frozen snapshot (lighting, head angle) over the following
+        # minutes, similarity eventually dropped below the match threshold
+        # for good, with nothing left to refresh it -- silently ending
+        # tracking for the rest of the video even though the same person
+        # was still clearly, continuously on screen. Updating on every
+        # match instead tracks gradual drift the way a real re-id
+        # comparison should: against the most recent known appearance.
+        pdata["hist"] = hist
         gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY) if (roi := frame_bgr[y:y+h, x:x+w]).size > 0 else None
         quality = face_size * (1 + _sharpness(gray_roi))
         if quality > pdata.get("quality", 0):
-            pdata.update(face=box, frame=frame_bgr.copy(), size=face_size, hist=hist, quality=quality)
+            pdata.update(face=box, frame=frame_bgr.copy(), size=face_size, quality=quality)
 
         results.append((box, pid, is_new))
 
