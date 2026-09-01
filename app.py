@@ -196,13 +196,18 @@ def _match_frame_faces(faces, frame_bgr, people, frame_idx, cut_detected,
     slot — but only if their absence clearly exceeds a normal occlusion gap
     (`recycle_after_frames`, deliberately much longer than `stale_frames`),
     so a person who just looked away or was briefly covered keeps their
-    reserved slot rather than losing it to someone else. A retired person
-    keeps their own separate id and their timeline so far is untouched —
-    they are NEVER merged with whoever takes their old slot. This is a
-    one-way trip: if they return later, they'll be treated as a new person
-    (getting a fresh id) rather than silently reactivated, since reactivating
-    them risks exceeding capacity again and adds the kind of ambiguity that
-    caused identity-merging bugs before.
+    reserved slot rather than losing it to someone else.
+
+    The freed slot's id is REUSED for whoever takes it over, rather than
+    minting a new one. This keeps the total number of distinct "Person N"
+    identities ever reported capped at exactly `max_people`, matching what
+    the "Max people to track" setting promises, and means tracking can
+    always resume after a genuine long absence instead of permanently
+    stopping once `max_people` identities have ever existed. The retired
+    person's timeline/photo data (kept elsewhere, keyed by this same id) is
+    left as-is when this happens; the caller uses the returned
+    `is_new_person` flag as the signal to start a fresh timeline for that
+    id, since it may now represent a different individual.
 
     Mutates `people` in place. Returns a list of (box, pid, is_new_person)
     for every face that got assigned; faces with nowhere to go (no match,
