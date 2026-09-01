@@ -11,6 +11,7 @@ from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
 import json
 import tempfile
 import os
+import shutil
 from io import BytesIO
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import A4
@@ -626,7 +627,16 @@ uploaded = st.file_uploader(
 
 if uploaded is not None:
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-    tmp.write(uploaded.read())
+    # Stream the upload to disk in chunks instead of `tmp.write(uploaded.read())`.
+    # `.read()` pulls the ENTIRE file into one in-memory bytes object first --
+    # for a 500MB video that's an extra ~500MB of RAM on top of whatever
+    # Streamlit's own upload widget is already holding internally, on top of
+    # TensorFlow + MediaPipe's baseline footprint. On Streamlit Community
+    # Cloud's 1GB free-tier RAM cap, that combination is exactly what was
+    # crashing the app (OOM kill -> health check connection reset) on large
+    # uploads. Streaming in fixed-size chunks keeps our own peak memory
+    # bounded regardless of file size.
+    shutil.copyfileobj(uploaded, tmp, length=4 * 1024 * 1024)  # 4MB chunks
     tmp.close()
     video_path = tmp.name
 
